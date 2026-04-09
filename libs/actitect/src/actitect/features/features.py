@@ -503,8 +503,8 @@ def build_aggregated_feature_list(
     default_aggregation = default_aggregation or (
         'mean', 'std', 'skew', 'kurt', 'mad', 'iqr', '10th_percentile', '90th_percentile')
     if from_yaml:
-        from actitect.config import PipelineConfig
-        cfg = PipelineConfig.from_yaml()
+        from actitect.config import ExternalTestConfig
+        cfg = ExternalTestConfig.from_yaml(which='external_test')
         local_base = cfg.data.loader.included_local_features
         aggregation = cfg.data.loader.aggregation
         global_names = cfg.data.loader.included_global_features

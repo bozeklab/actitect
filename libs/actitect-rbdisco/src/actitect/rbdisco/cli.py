@@ -108,9 +108,9 @@ def _run_setup():
         logger.warning("Overriding default results directory. Writing to: %s", root_save_path)
 
     if args.train_eval or args.train_pooled:
-        config = PipelineConfig.from_yaml(args.config_file)
+        config = PipelineConfig.from_yaml(which=None, yaml_path=args.config_file)
     elif args.test or args.predict:
-        config = ExternalTestConfig.from_yaml(args.config_file)
+        config = ExternalTestConfig.from_yaml(which=None, yaml_path=args.config_file)
         config.pretrained_model_dirs = [args.root_dir.joinpath(_dir) for _dir in config.pretrained_model_dirs]
     else:
         raise ValueError(f"must choose one of args.train_eval, args.test or args.predict.")
