@@ -163,6 +163,7 @@ class LoaderConfig(BaseConfig):
     included_global_features: List[str]
     rebalance_datasets: Optional[RebalanceDatasetsConfig] = None
     group_level: Optional[str] = 'patient'  # or 'record', will decide aggregation level
+    str_label_mapping: Optional[str] = None
 
 
 @dataclass

@@ -1,7 +1,7 @@
 import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,11 +9,34 @@ from sklearn.utils.class_weight import compute_class_weight
 
 from actitect import utils
 from actitect.config import RebalanceDatasetsConfig
+from actitect.rbdisco.configs import get_label_mappings
 from .types import FeatureSet
 
 __all__ = ['DataLoader']
 
 logger = logging.getLogger(__name__)
+
+
+def _build_code_to_label_map(mapping_name: str) -> dict[str, str]:
+    mappings = get_label_mappings()
+    if mapping_name not in mappings.mappings:
+        raise ValueError(
+            f"Unknown str_label_mapping='{mapping_name}'. "
+            f"Available mappings: {sorted(mappings.mappings.keys())}"
+        )
+
+    label_map = mappings.mappings[mapping_name]
+    code_to_label = {}
+    for label, codes in label_map.items():
+        for code in codes:
+            code_norm = str(code).strip().lower()
+            if code_norm in code_to_label and code_to_label[code_norm] != label:
+                raise ValueError(
+                    f"Ambiguous code '{code}' in mapping '{mapping_name}': "
+                    f"{code_to_label[code_norm]!r} vs {label!r}"
+                )
+            code_to_label[code_norm] = label
+    return code_to_label
 
 
 class DataLoader:
@@ -24,11 +47,13 @@ class DataLoader:
                  feature_dir: Path, aggregation: List[str],
                  included_local_features: List[str], included_global_features: List[str],
                  binary_mapping: dict, add_str_labels: bool = False, verbose: bool = True, shuffle: bool = True,
-                 rebalance_datasets: RebalanceDatasetsConfig = None, group_level: str = 'patient'):
+                 rebalance_datasets: RebalanceDatasetsConfig = None, group_level: str = 'patient',
+                 str_label_mapping: Optional[str] = None):
 
         self.dataset_is_pooled = isinstance(data_dir, list) and len(data_dir) > 1
         self.data_dirs = data_dir if isinstance(data_dir, list) else [data_dir]
         self.feature_dir = feature_dir  # relative to patient_dir
+        self.str_label_mapping = str_label_mapping
         self.local_feat_files = sorted([
             file for base_dir in self.data_dirs  # loop over patient dirs from datasets
             for file in list(base_dir.glob(f"*/{feature_dir}/*local*.csv"))  # single record/patient
@@ -200,6 +225,21 @@ class DataLoader:
         y_train = np.array(y[train_index_mask])
         y_str_train = np.array(y_str[train_index_mask]) if self.add_str_labels else None
 
+        logger.warning(f"n records_test = {len(self.records_test)}")
+        logger.warning(f"records_test sample = {list(self.records_test[:10])}")
+
+        logger.warning(f"n feat_df_night record_keys = {feat_df_night['record_key'].nunique()}")
+        logger.warning(
+            f"feat_df_night record_key sample = {feat_df_night['record_key'].drop_duplicates().tolist()[:10]}")
+
+        logger.warning(f"n test matches = {int(test_index_mask.sum())}")
+
+        _meta_keys = set(self.records_test.tolist())
+        _feat_keys = set(feat_df_night["record_key"].astype(str).tolist())
+
+        logger.warning(f"meta not in feat sample = {sorted(_meta_keys - _feat_keys)[:20]}")
+        logger.warning(f"feat not in meta sample = {sorted(_feat_keys - _meta_keys)[:20]}")
+
         x_test = np.array(x[test_index_mask])
         y_test = np.array(y[test_index_mask])
         y_str_test = np.array(y_str[test_index_mask]) if self.add_str_labels else None
@@ -297,15 +337,20 @@ class DataLoader:
 
     @staticmethod
     def _meta_make_record_keys(meta_df: pd.DataFrame) -> pd.Series:
-        """Return record_key series from meta_df rows: ID or ID_record_ID if present."""
-        rid = meta_df.get("record_ID")
-        if rid is None:
+        """Construct record_key from meta_df rows.
+        Rules (backwards compatible):
+        - If record_ID is missing, empty, 'none', or 'nan' → use 'ID'
+        - Otherwise → use 'ID_recordID'"""
+
+        if "record_ID" not in meta_df.columns:
             return meta_df["ID"].astype(str)
 
-        rid = rid.astype(str).str.strip()
-        is_missing = meta_df["record_ID"].isna() | rid.str.lower().isin({"none", ""})
-        return pd.Series(np.where(is_missing, meta_df["ID"].astype(str), meta_df["ID"].astype(str) + "_" + rid),
-                         index=meta_df.index)
+        def _make_key(row):
+            rid = DataLoader._normalize_record_id(row.get("record_ID"))
+            sid = str(row["ID"]).strip()
+            return sid if rid is None else f"{sid}_{rid}"
+
+        return meta_df.apply(_make_key, axis=1)
 
     def _get_meta(self, meta_csv_path: Path):
 
@@ -315,6 +360,10 @@ class DataLoader:
         assert 'diagnosis' in meta_df.columns, f"'meta_df' at {meta_csv_path} must contain a 'diagnosis' column."
         _is_null = meta_df.diagnosis.isnull()
         assert not meta_df.diagnosis.isnull().any(), "'diagnosis' column contains NaN values."
+
+        meta_df = meta_df.copy()
+        meta_df['diagnosis'], used_mapping = self._map_diagnosis_series_if_needed(
+            meta_df['diagnosis'], context=f"meta_df ({meta_csv_path})")
 
         mapping_keys, data_keys = set(self.binary_mapping.keys()), set(meta_df['diagnosis'].unique())
         unused_keys = mapping_keys - data_keys
@@ -340,13 +389,16 @@ class DataLoader:
         meta_df.insert(
             meta_df.columns.get_loc('diagnosis') + 1, 'binary_label', meta_df.diagnosis.map(self.binary_mapping))
 
+        if meta_df["binary_label"].isna().any():
+            bad = sorted(meta_df.loc[meta_df["binary_label"].isna(), "diagnosis"].unique().tolist())
+            raise ValueError(
+                f"meta_df contains diagnoses not covered by binary_mapping after mapping: {bad}. "
+                f"binary_mapping keys={sorted(self.binary_mapping.keys())}")
+
         # get the ids of the training and testing records
-        records_train = meta_df.loc[meta_df['train/test'] == 'train'].apply(
-            lambda row: row['ID'] if pd.isna(row['record_ID']) else f"{row['ID']}_{str(row['record_ID']).strip()}",
-            axis=1).to_numpy().astype('str')
-        records_test = meta_df.loc[meta_df['train/test'] == 'test'].apply(
-            lambda row: row['ID'] if pd.isna(row['record_ID']) else f"{row['ID']}_{str(row['record_ID']).strip()}",
-            axis=1).to_numpy().astype('str')
+        records_train = self._meta_make_record_keys(
+            meta_df.loc[meta_df['train/test'] == 'train']).astype(str).to_numpy()
+        records_test = self._meta_make_record_keys(meta_df.loc[meta_df['train/test'] == 'test']).astype(str).to_numpy()
 
         return meta_df, records_train, records_test
 
@@ -454,6 +506,10 @@ class DataLoader:
                 # select columns (robust against missing optional columns)
                 _df = _df[keep_cols]
 
+                _df = _df.copy()
+                _df["diagnosis"], used_mapping = self._map_diagnosis_series_if_needed(
+                    _df["diagnosis"], context=f"local feature file '{filename.name}'")
+
                 # normalize record_id and build record_key
                 _df["record_id"] = _df["record_id"].astype(str).str.strip()
                 _df["record_id"] = _df["record_id"].replace(["none", "NaN", "nan", "None", ""], None)
@@ -480,6 +536,12 @@ class DataLoader:
 
             # labels
             _local_feat_df["ground_truth"] = _local_feat_df.diagnosis.map(self.binary_mapping).values
+
+            if _local_feat_df["ground_truth"].isna().any():
+                bad = sorted(_local_feat_df.loc[_local_feat_df["ground_truth"].isna(), "diagnosis"].unique().tolist())
+                raise ValueError(
+                    f"Local feature dataframe contains diagnoses not covered by binary_mapping after mapping: {bad}. "
+                    f"binary_mapping keys={sorted(self.binary_mapping.keys())}")
 
             # handle problematic values in feature columns only
             excluded_cols = required_util_cols + ["record_id", "ident", "record_key", "diagnosis", "ground_truth",
@@ -649,12 +711,27 @@ class DataLoader:
             else:
                 patient_dir = self.data_dirs[0]
 
-            _feature_dir_path = (patient_dir / f"{_id}/{self.feature_dir}" if _record_id in [None, 'None']
-                                 else patient_dir / f"{_id}" / f"{_id}_{_record_id}/{self.feature_dir}")
-            _global_feat_paths = sorted(list(_feature_dir_path.glob('*global*.csv')))
+            _record_id_str = None if pd.isna(_record_id) else str(_record_id).strip()
+            if _record_id_str in [None, '', 'none', 'None']:
+                candidate_dirs = [
+                    patient_dir / f'{_id}' / self.feature_dir,
+                ]
+            else:
+                candidate_dirs = [
+                    patient_dir / f'{_id}' / f'{_id}_{_record_id_str}' / self.feature_dir,  # legacy layout
+                    patient_dir / f'{_id}' / _record_id_str / self.feature_dir,  # IRBDSG/new layout
+                ]
+
+            _global_feat_paths = []
+            for _feature_dir_path in candidate_dirs:
+                if _feature_dir_path.exists():
+                    _global_feat_paths.extend(sorted(_feature_dir_path.glob('*global*.csv')))
 
             if len(_global_feat_paths) != 1:
-                raise UserWarning(f"none or too many global feature files found for {_record_key}.")
+                raise UserWarning(
+                    f'none or too many global feature files found for {_record_key}. '
+                    f'candidate_dirs={candidate_dirs}, matches={_global_feat_paths}'
+                )
 
             else:
                 _global_features = pd.read_csv(_global_feat_paths[0])
@@ -895,3 +972,150 @@ class DataLoader:
                 ph = (h / t * 100) if t else 0.0
                 logger.info("\t - dataset %s (train): total = %3d, rbd = %3d, hc = %3d, rbd = %4.1f%%, hc = %4.1f%%",
                             ds, t, r, h, pr, ph)
+
+    def _get_expected_str_labels(self) -> set[str]:
+        """
+        Canonical harmonized diagnosis labels.
+
+        If a str_label_mapping is configured, use its label space
+        (e.g. {'HC', 'iRBD', 'PD-RBD', 'PD+RBD'}), not the current
+        binary task subset.
+        """
+        if self.str_label_mapping is not None:
+            mappings = get_label_mappings()
+            if self.str_label_mapping not in mappings.mappings:
+                raise ValueError(
+                    f"Unknown str_label_mapping='{self.str_label_mapping}'. "
+                    f"Available mappings: {sorted(mappings.mappings.keys())}"
+                )
+            return {str(label).strip() for label in mappings.mappings[self.str_label_mapping].keys()}
+
+        return {str(k).strip() for k in self.binary_mapping.keys()}
+
+    @staticmethod
+    def _normalize_diag_series(series: pd.Series) -> pd.Series:
+        return series.astype('string').str.strip()
+
+    def _labels_already_mapped(self, labels: set[str]) -> bool:
+        expected = {str(x).strip().lower() for x in self._get_expected_str_labels()}
+        observed = {str(x).strip().lower() for x in labels if str(x).strip() != ""}
+        return len(observed) > 0 and observed.issubset(expected)
+
+    @staticmethod
+    def _detect_suitable_label_mappings(labels: set[str]) -> list[str]:
+        """
+        Return mapping names whose code space fully covers the observed labels.
+        Only used when labels are not already mapped.
+        """
+        mappings = get_label_mappings()
+        labels_norm = {str(x).strip().lower() for x in labels if str(x).strip() != ""}
+
+        matches = []
+        for mapping_name, label_map in mappings.mappings.items():
+            covered_codes = {
+                str(code).strip().lower()
+                for codes in label_map.values()
+                for code in codes
+            }
+            if labels_norm.issubset(covered_codes):
+                matches.append(mapping_name)
+        return sorted(matches)
+
+    def _resolve_str_label_mapping(self, labels: set[str]) -> Optional[str]:
+        """
+        Decide whether labels need remapping and which mapping to use.
+
+        Rules:
+        - if labels are already mapped -> return None
+        - if config explicitly defines str_label_mapping -> validate and return it
+        - else autodetect:
+            * 0 matches -> raise
+            * 1 match -> return it
+            * >1 matches -> raise and ask user to define one explicitly
+        """
+        if self._labels_already_mapped(labels):
+            return None
+
+        labels_norm = {str(x).strip().lower() for x in labels if str(x).strip() != ""}
+
+        if self.str_label_mapping is not None:
+            code_to_label = _build_code_to_label_map(self.str_label_mapping)
+            covered = set(code_to_label.keys())
+            missing = sorted(labels_norm - covered)
+            if missing:
+                raise ValueError(
+                    f"Configured str_label_mapping='{self.str_label_mapping}' does not cover all observed "
+                    f"diagnosis labels. Missing labels: {missing}"
+                )
+            logger.warning(
+                "Diagnosis labels are not in pipeline label space %s. "
+                "Applying configured str_label_mapping='%s'. Observed raw labels: %s",
+                sorted(self._get_expected_str_labels()),
+                self.str_label_mapping,
+                sorted(labels),
+            )
+            return self.str_label_mapping
+
+        matches = self._detect_suitable_label_mappings(labels)
+        if len(matches) == 0:
+            raise ValueError(
+                f"Diagnosis labels are not already mapped and no suitable string-label mapping was found. "
+                f"Observed labels: {sorted(labels)}. "
+                f"Please define data.loader.str_label_mapping explicitly in the YAML."
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Diagnosis labels are not already mapped and autodetection is ambiguous. "
+                f"Observed labels: {sorted(labels)}. Suitable mappings: {matches}. "
+                f"Please define data.loader.str_label_mapping explicitly in the YAML."
+            )
+
+        logger.warning(
+            "Diagnosis labels are not in pipeline label space %s. "
+            "Autodetected str_label_mapping='%s'. Observed raw labels: %s",
+            sorted(self._get_expected_str_labels()),
+            matches[0],
+            sorted(labels),
+        )
+        return matches[0]
+
+    def _map_diagnosis_series_if_needed(self, diagnosis: pd.Series, context: str) -> Tuple[pd.Series, Optional[str]]:
+        """
+        Map raw diagnosis labels to final pipeline string labels if needed.
+        Returns:
+            mapped_series, mapping_name_or_None
+        """
+        diag = self._normalize_diag_series(diagnosis)
+        observed = set(diag.dropna().unique().tolist())
+
+        mapping_name = self._resolve_str_label_mapping(observed)
+        if mapping_name is None:
+            return diag, None
+
+        code_to_label = _build_code_to_label_map(mapping_name)
+        mapped = diag.str.lower().map(code_to_label)
+
+        unmapped_mask = mapped.isna()
+        if unmapped_mask.any():
+            bad = sorted(diag.loc[unmapped_mask].unique().tolist())
+            raise ValueError(
+                f"{context}: after applying str_label_mapping='{mapping_name}', some diagnosis labels "
+                f"remain unmapped: {bad}"
+            )
+
+        logger.info(
+            "%s: applied str_label_mapping='%s'. Diagnosis counts after mapping: %s",
+            context,
+            mapping_name,
+            mapped.value_counts(dropna=False).to_dict(),
+        )
+        return mapped, mapping_name
+
+    @staticmethod
+    def _normalize_record_id(record_id):
+        if pd.isna(record_id):
+            return None
+        r = str(record_id).strip().lower()
+        if r in {"", "none", "nan"}:
+            return None
+        return r

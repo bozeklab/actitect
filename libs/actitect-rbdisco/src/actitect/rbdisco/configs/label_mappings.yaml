@@ -1,0 +1,52 @@
+
+
+IRBDSG: # dataset from IRBDSG containing a,b,c,... labels, including also nonPSG controls
+  iRBD:
+    - 'a'  # Idiopathic/isolated RBD, PSG-confirmed (definite)
+  PD+RBD:
+    - 'h'  # PD with RBD, PSG-confirmed
+  PD-RBD:
+    - 'j'  # PD without RBD or RSWA, PSG-confirmed
+  HC:
+    - 'c'  # Control without RSWA or RBD symptoms, PSG-confirmed
+    - 'r' # nonPSG confirmed controls 
+
+IRBDSG_PSG_ONLY: # dataset from IRBDSG containing a,b,c,... labels
+  iRBD:
+    - 'a'  # Idiopathic/isolated RBD, PSG-confirmed (definite)
+  PD+RBD:
+    - 'h'  # PD with RBD, PSG-confirmed
+  PD-RBD:
+    - 'j'  # PD without RBD or RSWA, PSG-confirmed
+  HC:
+    - 'c'  # Control without RSWA or RBD symptoms, PSG-confirmed
+
+
+IRBDSG_incl_RSWA_as_HC:
+  iRBD:
+    - 'a'  # Idiopathic/isolated RBD, PSG-confirmed (definite)
+  PD+RBD:
+    - 'h'  # PD with RBD, PSG-confirmed
+  PD-RBD:
+    - 'j'  # PD without RBD or RSWA, PSG-confirmed
+  HC:
+    - 'c'  # Control without RSWA or RBD symptoms, PSG-confirmed
+    - 'b'  # Isolated RSWA without RBD, PSG-confirmed
+
+
+# Not mapped into the 4-class scheme:
+# d, RBD associated with narcolepsy (PSGonfirmed);
+# e, RBD associated with PTSD (PSGonfirmed);
+# f, RBD associated with antidepressant treatment (PSGonfirmed);
+# g, RBD associated with other condition (e.g. lesion), PSGonfirmed;
+# i, PD with isolated RSWA, PSGonfirmed (not fulfilling RBD criteria);
+# k, MSA with RBD, PSGonfirmed;
+# l, MSA with isolated RSWA, PSGonfirmed (not fulfilling RBD criteria);
+# m, MSA without RBD or RSWA, PSGonfirmed;
+# n, DLB with RBD, PSGonfirmed;
+# o, DLB with isolated RSWA, PSGonfirmed (not fulfilling RBD criteria);
+# p, DLB without RBD or RSWA, PSGonfirmed;
+# q, RBD in non-synucleinopathy neurodegenerative disorders (e.g. Alzheimer’s disease,
+# Huntington’s disease, PSP), PSGonfirmed
+# r, Non-PSG-proven control (no RBD symptoms reported or observed, REM atonia unverified);
+# s, RBE (REM behavioral events: PSG-proven motor behaviors during REM sleep, but normal REM atonia)

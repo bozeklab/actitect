@@ -15,8 +15,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['get_experiment_root', 'load_yaml_file', 'detect_csv_delimiter', 'read_meta_csv_to_df', 'dump_to_json',
-           'read_from_json', 'get_file_extension', 'check_make_dir', 'str_to_snake_case', 'resolve_root_or_abs_path']
+__all__ = [
+    'get_experiment_root', 'load_yaml_file', 'dump_yaml_file', 'detect_csv_delimiter', 'read_meta_csv_to_df',
+    'dump_to_json', 'read_from_json', 'get_file_extension', 'check_make_dir', 'str_to_snake_case',
+    'resolve_root_or_abs_path'
+]
 
 
 def check_make_dir(dir_path: Path, use_existing=False, verbose=True, time_extension: bool = True):
@@ -113,6 +116,17 @@ def load_yaml_file(path):
             return _cfg
         except yaml.YAMLError as exc:
             logger.error(f"(io): error ({exc}) encountered while loading config {path}")
+
+
+def dump_yaml_file(data: Any, file_path: Union[str, Path], *, sort_keys: bool = False):
+    file_path = Path(file_path)
+
+    try:
+        with open(file_path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=sort_keys, default_flow_style=False)
+    except yaml.YAMLError as exc:
+        logger.error(f"(io): error ({exc}) encountered while writing yaml file {file_path}")
+        raise
 
 
 def detect_csv_delimiter(filepath: Union[str, Path], *, sample_size: int = 1 << 14,
