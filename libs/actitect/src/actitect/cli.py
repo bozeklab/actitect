@@ -18,7 +18,9 @@ def _process_dataset(args: argparse.Namespace, processing_kwargs: dict, feature_
     assert _meta_file.is_file(), f"can't find 'metadata.csv' file {_meta_file}."
 
     meta_df = utils.read_meta_csv_to_df(_meta_file)
-    _raw_files = sorted(chain.from_iterable(_data_dir.glob(f"*{ext}") for ext in SUPPORTED_FILETYPES))
+    _raw_files = sorted(
+        p for p in chain.from_iterable(_data_dir.glob(f"*{ext}") for ext in SUPPORTED_FILETYPES)
+        if not p.name.startswith("._") and not p.name.startswith("."))
 
     if not _raw_files:
         raise UserWarning(f"No actigraphy files found at {_data_dir}")
@@ -27,47 +29,55 @@ def _process_dataset(args: argparse.Namespace, processing_kwargs: dict, feature_
     _excluded = {}
     with utils.custom_tqdm(total=len(_raw_files), position=0, leave=True) as pbar:
         for i, file_path in enumerate(_raw_files):
+            _rec_label = file_path.name  # fallback only
 
             try:
                 _meta = meta_df[meta_df['filename'] == file_path.name]
                 if _meta.empty or _meta.shape[0] > 1:
-                    raise UserWarning(f"missing or double entry in 'data/raw/meta/metadata.csv' for {file_path},"
-                                      f"fix and try again")
+                    raise UserWarning(
+                        f"missing or double entry in 'data/raw/meta/metadata.csv' for {file_path}, fix and try again"
+                    )
+
                 _meta = _meta.iloc[0].to_dict()
                 _patient_id = _meta.get('ID') or 'none'
-                _record_ID = str(_meta.get('record_ID')).strip() \
-                    if pd.notna(_meta.get('record_ID')) else "none"
+                _record_ID = str(_meta.get('record_ID')).strip() if pd.notna(_meta.get('record_ID')) else "none"
                 _diagnosis = _meta.get('diagnosis') or 'none'
-                _rec_label = f"{_patient_id} ({_record_ID})" \
-                    if _record_ID and _record_ID != "none" else _patient_id
-                if _meta['exclude'] == 1:
-                    _excluded.update({f"{_rec_label}": "meta"})
-                    raise UserWarning(f"excluding {_rec_label} according to meta.")
-                else:
 
-                    file_processor = FileProcessor(
-                        _patient_id, _record_ID, _diagnosis, file_path, save_dir,
-                        save_processed_data=args.save_processed, ax6_legacy_mode=args.ax6_legacy_mode)
-                    file_processor.process(feature_kwargs, processing_kwargs, args, pbar)
-                    del file_processor
-                    gc.collect()
+                _rec_label = f"{_patient_id} ({_record_ID})" if _record_ID and _record_ID != "none" else _patient_id
+
+                if _meta['exclude'] == 1:
+                    _excluded[_rec_label] = "meta"
+                    raise UserWarning(f"excluding {_rec_label} according to meta.")
+
+                file_processor = FileProcessor(
+                    _patient_id, _record_ID, _diagnosis, file_path, save_dir,
+                    save_processed_data=args.save_processed,
+                    ax6_legacy_mode=args.ax6_legacy_mode,
+                )
+                file_processor.process(feature_kwargs, processing_kwargs, args, pbar)
+                del file_processor
+                gc.collect()
 
             except NotImplementedError as _ne:
                 logger.warning(
                     f"NotImplementedError {_ne} encountered in process_single_file({_rec_label}). "
                     f"Might be caused by unknown 'feature_mode': got '{feature_kwargs.get('feature_mode')}', "
-                    f"implemented: 'per_night'.")
+                    f"implemented: 'per_night'."
+                )
                 logger.warning(f"Excluded: {_rec_label}")
-                _excluded.update({_rec_label: f"{_ne}"})
+                _excluded[_rec_label] = f"{_ne}"
+
             except UserWarning as _uw:
                 logger.warning(f"UserWarning {_uw} encountered in process_single_file({_rec_label}).")
                 logger.warning(f"Excluded: {_rec_label}")
-                _excluded.update({_rec_label: f"{_uw}"})
+                _excluded[_rec_label] = f"{_uw}"
+
             except Exception as e:
                 logger.warning(f"Exception {e} encountered in process_single_file({_rec_label}).")
                 logger.warning(f"Excluded: {_rec_label}")
-                _excluded.update({_rec_label: f"{e}"})
+                _excluded[_rec_label] = f"{e}"
                 traceback.print_exc()
+
             pbar.update(1)
 
         logger.info(f"\n ...processing finished. Excluded: {_excluded} ({len(_excluded)}) "
