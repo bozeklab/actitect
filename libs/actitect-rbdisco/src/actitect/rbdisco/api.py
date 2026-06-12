@@ -136,12 +136,13 @@ class RBDiscoPredictor:
 
     @staticmethod
     def _df_to_feature_set(df: pd.DataFrame, subject_id: Union[str, None] = None) -> FeatureSet:
-        """ Convert a DataFrame object returned from actitect.api.compute_sleep_motor_features into a FeatureSet
-        instance compatible with RBDisco API."""
-        feature_list = [_f for _f in build_aggregated_feature_list(from_yaml=True) if _f in df.columns]
-        feat_subset = df[feature_list]
-        groups = [subject_id] * feat_subset.shape[0] if subject_id else None
-        return FeatureSet(x=feat_subset.to_numpy(), group=groups, feat_map=feature_list)
+        """ Convert a DataFrame returned by compute_sleep_motor_features into a FeatureSet for RBDisco inference. """
+        feature_list = [feature for feature in build_aggregated_feature_list(from_yaml=True, order='dataloader')
+            if feature in df.columns]
+
+        feat_subset = df.loc[:, feature_list]
+        groups = np.array([subject_id] * feat_subset.shape[0]) if subject_id else None
+        return FeatureSet(x=feat_subset.to_numpy(), group=groups, feat_map=np.asarray(feature_list))
 
     def aggregate_night_df_to_patient_level(self, night_fs: FeatureSet, night_df: pd.DataFrame) -> pd.DataFrame:
         night_fs.y = np.zeros(night_fs.x.shape[0])  # temporarily set ground_truth for compat

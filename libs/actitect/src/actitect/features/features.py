@@ -490,20 +490,21 @@ def _compute_local_features_per_night(
 
 
 def build_aggregated_feature_list(
-        from_yaml: bool,
-        *,
-        default_aggregation: List[str] = None,
-) -> np.ndarray:
-    """Return exhaustive feature names: all GLOBAL names + aggregated LOCAL names.
+        from_yaml: bool, *, default_aggregation: List[str] = None, order: str = 'dataloader') -> np.ndarray:
+    """Return exhaustive feature names in the requested order.
     Parameters:
-        :param from_yaml: (bool): whether to return feature names from YAML config, otherwise build full list.
-        :param default_aggregation: (list[str]) of aggregation suffixes applied to each local base feature.
+        :param from_yaml: (bool) Whether to load feature names from the YAML configuration.
+        :param default_aggregation: (list[str], None) Aggregation suffixes used when not loading from YAML.
+        :param order: (str) Feature ordering: 'legacy' or 'dataloader'.
     Returns:
-        :return: (np.ndarray) of feature names."""
+        :return feature_names: (np.ndarray) Ordered feature names."""
+
     default_aggregation = default_aggregation or (
         'mean', 'std', 'skew', 'kurt', 'mad', 'iqr', '10th_percentile', '90th_percentile')
+
     if from_yaml:
         from actitect.config import ExternalTestConfig
+
         cfg = ExternalTestConfig.from_yaml(which='external_test')
         local_base = cfg.data.loader.included_local_features
         aggregation = cfg.data.loader.aggregation
@@ -512,10 +513,18 @@ def build_aggregated_feature_list(
     else:
         local_base = CalcLocalMoveFeatures(mode='per_night', sample_rate=None).get_feature_names()
         aggregation = default_aggregation
-        global_names: List[str] = CalcGlobalMoveFeatures(
-            mode='per_night', global_move_segments_df=None, names_only=True, create_cluster_plots=False).get_feature_names()
+        global_names = CalcGlobalMoveFeatures(
+            mode='per_night',
+            global_move_segments_df=None,
+            names_only=True,
+            create_cluster_plots=False).get_feature_names()
 
-    local_agg = [f"{name}_{agg}" for name in local_base for agg in aggregation]
-    return np.array(list(global_names) + local_agg)
+    if order == 'legacy':  # previous ordering kept for backward reproducibitliy, only affect API, not CLI
+        local_aggregated = [f'{name}_{agg}' for name in local_base for agg in aggregation]
+        return np.asarray(list(global_names) + local_aggregated)
 
+    if order == 'dataloader':  # propper order that matches dataloader
+        local_aggregated = [f'{name}_{agg}' for agg in aggregation for name in local_base]
+        return np.asarray(local_aggregated + list(global_names))
 
+    raise ValueError(f"Unknown feature order '{order}'. Expected 'legacy' or 'dataloader'.")
