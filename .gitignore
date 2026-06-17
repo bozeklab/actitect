@@ -22,9 +22,11 @@ libs/*/*.egg-info
 
 # copied docs (not tracked; copied at build time)
 libs/actitect/README.md
+libs/actitect/CITATION.cff
 libs/actitect/LICENSE
 libs/actitect-rbdisco/README.md
 libs/actitect-rbdisco/LICENSE
+libs/actitect-rbdisco/CITATION.cff
 libs/actitect/src/actitect/config/experiment_root.local.json
 
 # Data
