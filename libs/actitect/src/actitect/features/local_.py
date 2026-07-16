@@ -134,6 +134,7 @@ def spectral_features(magnitude, n_dom_freqs: int, target_frequencies_hz: list, 
         - avg_sp_power: Average spectral power."""
     spectral_feats = {}
     _nperseg = sample_rate if len(magnitude) >= sample_rate else len(magnitude)
+
     try:
         freqs, psd = scipy.signal.welch(
             magnitude,
@@ -146,20 +147,40 @@ def spectral_features(magnitude, n_dom_freqs: int, target_frequencies_hz: list, 
         )
         asd = np.sqrt(psd)
 
-        # extract the asd at the target freqs:
-        if not set(target_frequencies_hz).issubset(set(freqs)):
-            asd_interp = scipy.interpolate.interp1d(freqs, asd, kind='cubic')  # interpolate asd to find target_freqs...
-            spectral_feats.update({f"asd_{f}": float(asd_interp(f)) for f in target_frequencies_hz})
-        else:
-            spectral_feats.update({f"asd_{i}": asd[i] for i, f in enumerate(freqs) if f in target_frequencies_hz})
+        # extract the ASD at the target frequencies:
+        max_available_freq = float(freqs[-1])
+        asd_interp = scipy.interpolate.interp1d(freqs, asd, kind='cubic')
+
+        for target_freq in target_frequencies_hz:
+            effective_freq = min(float(target_freq), max_available_freq)
+
+            if target_freq > max_available_freq:
+                logger.warning(
+                    "Requested ASD frequency %.2f Hz exceeds the maximum measurable frequency %.2f Hz "
+                    "(sample_rate=%s Hz, Nyquist=%.2f Hz). Using the ASD at %.2f Hz instead.",
+                    target_freq,
+                    max_available_freq,
+                    sample_rate,
+                    sample_rate / 2,
+                    effective_freq,
+                )
+
+            if effective_freq in freqs:
+                value = asd[np.where(freqs == effective_freq)[0][0]]
+            else:
+                value = asd_interp(effective_freq)
+
+            spectral_feats[f"asd_{target_freq}"] = float(value)
 
         # find the top n dominant freqs:
         peaks, _ = scipy.signal.find_peaks(asd)
         peak_powers = asd[peaks]
         peak_freqs = freqs[peaks]
         peak_ranks = np.argsort(peak_powers)[::-1]
+
         spectral_feats.update({f"f{i + 1}": 0 for i in range(n_dom_freqs)})
         spectral_feats.update({f"p{i + 1}": 0 for i in range(n_dom_freqs)})
+
         for i, j in enumerate(peak_ranks[:n_dom_freqs]):
             spectral_feats[f"f{i + 1}"] = peak_freqs[j]
             spectral_feats[f"p{i + 1}"] = peak_powers[j]
@@ -170,15 +191,22 @@ def spectral_features(magnitude, n_dom_freqs: int, target_frequencies_hz: list, 
             'avg_sp_power': np.sum(asd)
         })
 
-    except ValueError as value_error:  # timeseries too short
-        logger.warning(f"Timeseries too short. (ValueError: {value_error} in spectral_features.)")
+    except ValueError as value_error:
+        logger.warning(f"Spectral feature computation failed. (ValueError: {value_error} in spectral_features.)")
         spectral_feats.update({f"asd_{f}": np.NaN for f in target_frequencies_hz})
         spectral_feats.update({f"f{i + 1}": np.NaN for i in range(n_dom_freqs)})
         spectral_feats.update({f"p{i + 1}": np.NaN for i in range(n_dom_freqs)})
-        spectral_feats.update({
-            'sp_entropy': scipy.stats.entropy(asd[asd > 0]),
-            'avg_sp_power': np.sum(asd)
-        })
+
+        if 'asd' in locals():
+            spectral_feats.update({
+                'sp_entropy': scipy.stats.entropy(asd[asd > 0]),
+                'avg_sp_power': np.sum(asd)
+            })
+        else:
+            spectral_feats.update({
+                'sp_entropy': np.NaN,
+                'avg_sp_power': np.NaN
+            })
 
     if debug:
         return spectral_feats, freqs, asd
