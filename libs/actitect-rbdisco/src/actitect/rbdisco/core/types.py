@@ -489,68 +489,6 @@ class FeatureSet:
 
         self.process_params['scaler'] = scaler_info
 
-        # === Transform path (inference / later stages) ===
-        # Rebuild scaler and apply either per-site or inference params without refitting
-        strategy = scaler_info.get('strategy', 'global')
-        base_name = scaler_info.get('name', base_name).split(':', 1)[0]  # ensure base name
-
-        if strategy == 'global':
-            scaler = scaler_class()
-            # load fitted attributes
-            for attr, value in scaler_info.items():
-                if attr.endswith("_"):
-                    setattr(scaler, attr, np.array(value))
-            self.x = scaler.transform(self.x)
-            logger.info(f"applying pre-fitted global {base_name} scaler.")
-            self.process_params['scaler'] = scaler_info
-            return
-
-        # Per-dataset transform: use per-site if known train site; else inference macro
-        per_site = scaler_info.get('per_site', {})
-        inference = scaler_info.get('inference', None)
-        if inference is None:
-            raise ValueError("Per-dataset scaler requires 'inference' parameters in process_params['scaler'].")
-
-        X = self.x
-        if self.dataset is None:
-            # No site labels available: apply inference macro to all
-            scaler = scaler_class()
-            for attr, value in inference.items():
-                if attr.endswith("_"):
-                    setattr(scaler, attr, np.array(value))
-            self.x = scaler.transform(X)
-            logger.info(f"applied {base_name} inference macro scaler to all samples (no dataset labels).")
-            self.process_params['scaler'] = scaler_info
-            return
-
-        ds = __as_np(self.dataset)
-        unique_sites_in_batch = np.unique(ds)
-
-        # Apply per-site where available; otherwise inference
-        X_out = np.empty_like(X, dtype=float)
-        used_inference_for = []
-        for site in unique_sites_in_batch:
-            mask = (ds == site)
-            site_key = str(site)
-            scaler = scaler_class()
-            params = per_site.get(site_key, None)
-            if params is None:
-                # held-out site → use inference macro
-                used_inference_for.append(site_key)
-                params = inference
-            for attr, value in params.items():
-                if attr.endswith("_"):
-                    setattr(scaler, attr, np.array(value))
-            X_out[mask] = scaler.transform(X[mask])
-
-        self.x = X_out
-        if used_inference_for:
-            logger.info(f"applied inference macro scaler for held-out site(s): {used_inference_for}")
-        else:
-            logger.info(f"applied per-site scalers for known training sites: {list(unique_sites_in_batch)}")
-
-        self.process_params['scaler'] = scaler_info
-
     def _apply_smote(self, seed: int, mode: str = 'global'):
         """
         Apply SMOTE either globally (pooled) or per dataset (site-wise), and store per-site details.
@@ -681,9 +619,17 @@ class FeatureSet:
         # Keep only valid FeatureRanker kwargs
         base_root = Path(rank_kwargs['root_dir']) if 'root_dir' in rank_kwargs else None
         valid_ranker_kwargs = {
-            k: rank_kwargs[k]
-            for k in ('root_dir', 'data_config', 'n_jobs', 'draw_plots', 'random_state')
-            if k in rank_kwargs
+            key: rank_kwargs[key]
+            for key in (
+                'root_dir',
+                'data_config',
+                'n_jobs',
+                'draw_plots',
+                'random_state',
+                'legacy_mode',
+                'feature_selection_config',
+            )
+            if key in rank_kwargs
         }
 
         # Simple path: single dataset or fair disabled -> vanilla ranking

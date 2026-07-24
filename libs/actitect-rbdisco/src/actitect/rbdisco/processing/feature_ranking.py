@@ -3,7 +3,7 @@ import logging
 import sys
 import warnings
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,7 +15,7 @@ from scipy import stats
 from sklearn.preprocessing import MinMaxScaler
 
 from actitect import utils
-from actitect.config import DataConfig
+from actitect.config import DataConfig, FeatureSelectionConfig
 from ..core.types import FeatureSet
 from ..models import ModelFactory
 
@@ -27,7 +27,8 @@ __all__ = ['FeatureRanker']
 class FeatureRanker:
 
     def __init__(self, root_dir: Path, data_config: DataConfig, n_jobs: int,
-                 draw_plots: bool = False, random_state: int = 42, legacy_mode: bool = False):
+                 draw_plots: bool = False, random_state: int = 42, legacy_mode: bool = False,
+                 feature_selection_config: Optional[FeatureSelectionConfig] = None):
         """Class to run different feature ranking algorithms and produce an ensemble ranking to identify the best
         features.
         Parameters:
@@ -46,6 +47,7 @@ class FeatureRanker:
         self.draw_plots = draw_plots
         self.random_state = random_state
         self.legacy_mode = legacy_mode
+        self.feature_selection_config = feature_selection_config
 
         self.ranking_file_postfix = f"combined_rankings_{self.data_config.agg_level}.csv"
         self.method_dispatch = {
@@ -105,8 +107,19 @@ class FeatureRanker:
             :return: (pd.DataFrame) Containing ranks of each feature selection segment and a combined, weighted rank."""
 
         if ranking_methods is None:
-            ranking_methods = [('mrmr', 1.0), ('boruta', 1.0), ('corr_label', 1.0),
-                               ('corr_inter', .2), ('stat_sign', 1.0), ('var', 1.0)]
+            ranking_methods = [
+                ('mrmr', 1.0),
+                ('corr_label', 1.0),
+                ('corr_inter', 0.2),
+                ('stat_sign', 1.0),
+                ('var', 1.0),
+            ]
+
+            if self.use_boruta:
+                ranking_methods.insert(1, ('boruta', 1.0))
+            else:
+                logger.warning('Boruta disabled through model.feature_selection.use_boruta.')
+        logger.info('Active feature-ranking methods: %s', [method for method, _ in ranking_methods])
 
         rank_df = pd.DataFrame({})
         _weight_arr = []
@@ -154,37 +167,68 @@ class FeatureRanker:
         gc.collect()
         return rank_df
 
-    def _run_boruta(self, proxy_model: str = 'rf', n_iterations: int = 10):
+    def _run_boruta(self, proxy_model: str = 'rf'):
         def __run_boruta_iteration(_data: FeatureSet, _model, iteration_seed: int):
             boruta_selector = BorutaPy(
                 verbose=0,
                 estimator=_model,
-                n_estimators='auto',
+                n_estimators=settings['n_estimators'],
                 perc=100,
-                alpha=0.05,  # how large the rejection/keep tail of polynomial should be (e.g. 0.5%)
-                max_iter=1_000,  # number of iterations to perform, use more! (huge number+early_stopping?)
+                alpha=0.05,
+                max_iter=settings['max_iter'],
                 early_stopping=True,
-                n_iter_no_change=10,  # if early_stopping: patience (of confirming a tentative feature)
-                random_state=iteration_seed
+                n_iter_no_change=settings['n_iter_no_change'],
+                random_state=iteration_seed,
             )
             boruta_selector.fit(_data.x, _data.y)
-
             return boruta_selector.ranking_, boruta_selector.importance_history_
 
-        with utils.Timer() as _timer:
-            _out_dir = utils.check_make_dir(self.out_dir.joinpath('boruta/'), True)
+        with utils.Timer() as timer:
+            out_dir = utils.check_make_dir(self.out_dir / 'boruta', True)
+            settings = self._get_boruta_settings()
 
             n_hc_train, n_rbd_train = np.unique(self.data.y, return_counts=True)[1]
             model_factory = ModelFactory(
-                proxy_model, cls_balance=n_hc_train / n_rbd_train, seed=self.random_state, top_k_cfg=None)
+                proxy_model,
+                cls_balance=n_hc_train / n_rbd_train,
+                seed=self.random_state,
+                top_k_cfg=None,
+            )
             model_setup = model_factory.build()
             model = model_setup.model().set_params(**model_setup.default_params)
+            model.set_params(max_depth=settings['max_depth'])
+
+            if settings['rf_n_jobs'] is not None:
+                model.set_params(n_jobs=settings['rf_n_jobs'])
+
+            if settings['max_samples'] is not None:
+                assert model.get_params()['bootstrap'], 'RandomForest max_samples requires bootstrap=True.'
+
+                model.set_params(max_samples=settings['max_samples'])
+
+            n_iterations = settings['n_iterations']
+            n_parallel_jobs = min(n_iterations, self.n_jobs) if self.n_jobs > 0 else n_iterations
+
+            logger.info(
+                'Boruta setup: samples=%d, speedup=%s, threshold=%s, repetitions=%d, trees=%s, max_depth=%s, '
+                'max_samples=%s, max_iter=%d, patience=%d, outer_jobs=%d, rf_jobs=%s',
+                len(self.data.y),
+                settings['speedup_applied'],
+                settings['sample_threshold'],
+                n_iterations,
+                settings['n_estimators'],
+                settings['max_depth'],
+                settings['max_samples'],
+                settings['max_iter'],
+                settings['n_iter_no_change'],
+                n_parallel_jobs,
+                model.get_params().get('n_jobs'),
+            )
 
             boruta_history = []
-            ranks = np.zeros((n_iterations, len(self.data.feat_map)))
-            boruta_ranks = np.zeros_like(ranks)
+            boruta_ranks = np.zeros((n_iterations, len(self.data.feat_map)))
 
-            with Parallel(n_jobs=self.n_jobs) as boruta_executor:
+            with Parallel(n_jobs=n_parallel_jobs) as boruta_executor:
                 results = boruta_executor(
                     delayed(__run_boruta_iteration)(self.data, model, self.random_state + iteration)
                     for iteration in range(n_iterations)
@@ -194,13 +238,12 @@ class FeatureRanker:
                 boruta_ranks[iteration] = ranking
                 boruta_history.append(importance_history)
 
-            boruta_rank_mean = np.mean(boruta_ranks, axis=0).astype('int')
-            boruta_rank_std = np.std(boruta_ranks, axis=0).astype('int')
+            boruta_rank_mean = np.mean(boruta_ranks, axis=0).astype(int)
+            boruta_rank_std = np.std(boruta_ranks, axis=0).astype(int)
 
-            _mean_importance_per_iteration = np.array([np.nanmean(history, axis=0) for history in boruta_history])
-            importance_mean = np.mean(_mean_importance_per_iteration, axis=0)
-            importance_std = np.std(_mean_importance_per_iteration, axis=0)
-
+            mean_importance_per_iteration = np.asarray([np.nanmean(history, axis=0) for history in boruta_history])
+            importance_mean = np.mean(mean_importance_per_iteration, axis=0)
+            importance_std = np.std(mean_importance_per_iteration, axis=0)
             rank = stats.rankdata(-importance_mean, method='max')
 
             ranking = pd.DataFrame({
@@ -211,25 +254,96 @@ class FeatureRanker:
                 ('rel_importance', 'std/mean'): importance_std / importance_mean,
                 ('boruta_rank', 'mean'): boruta_rank_mean,
                 ('boruta_rank', 'std'): boruta_rank_std,
-                ('boruta_rank', 'std/mean'): boruta_rank_std / boruta_rank_mean
+                ('boruta_rank', 'std/mean'): boruta_rank_std / boruta_rank_mean,
             })
             ranking.columns = pd.MultiIndex.from_tuples([
-                ('name', ''), ('rank', ''),
-                ('rel_importance', 'mean'), ('rel_importance', 'std'), ('rel_importance', 'std/mean'),
-                ('boruta_rank', 'mean'), ('boruta_rank', 'std'), ('boruta_rank', 'std/mean')
+                ('name', ''),
+                ('rank', ''),
+                ('rel_importance', 'mean'),
+                ('rel_importance', 'std'),
+                ('rel_importance', 'std/mean'),
+                ('boruta_rank', 'mean'),
+                ('boruta_rank', 'std'),
+                ('boruta_rank', 'std/mean'),
             ])
             ranking = ranking.sort_values(by='rank').set_index('rank')
-            ranking.to_csv(_out_dir.joinpath(f"boruta_{self.data_config.agg_level}.csv"))
+            ranking.to_csv(out_dir / f'boruta_{self.data_config.agg_level}.csv')
+
+            settings_json = {
+                'proxy_model': proxy_model,
+                'platform': sys.platform,
+                'random_state': self.random_state,
+                'n_jobs': self.n_jobs,
+                'n_parallel_jobs': n_parallel_jobs,
+                'n_samples': len(self.data.y),
+                **settings,
+                'elapsed(s)': timer(),
+            }
+            utils.dump_to_json(settings_json, out_dir / 'setting.json')
+
+            logger.info('Applied Boruta. (%.2fs)', timer())
 
             del rank, boruta_rank_mean, boruta_rank_std, importance_mean, importance_std
             gc.collect()
-            logger.info(f"applied Boruta. ({_timer()}s)")
-            utils.dump_to_json({'proxy_model': proxy_model, 'platform': sys.platform,
-                                'random_state': self.random_state,
-                                'n_jobs': self.n_jobs, 'n_iterations': n_iterations, 'elapsed(s)': _timer()},
-                               _out_dir.joinpath('setting.json'))
 
-        return {f"{self.data_config.agg_level}": ranking}
+        return {self.data_config.agg_level: ranking}
+
+    @property
+    def use_boruta(self) -> bool:
+        return True if self.feature_selection_config is None else self.feature_selection_config.use_boruta
+
+    def _get_boruta_settings(self) -> dict:
+        """ Resolve the effective Boruta settings for the current dataset."""
+        defaults = {
+            'n_iterations': 10,
+            'n_estimators': 'auto',
+            'max_depth': None,
+            'max_samples': None,
+            'max_iter': 1_000,
+            'n_iter_no_change': 10,
+            'rf_n_jobs': None,
+
+        }
+
+        if self.feature_selection_config is None:
+            return {**defaults, 'speedup_applied': False, 'sample_threshold': None}
+
+        cfg = self.feature_selection_config
+        threshold = cfg.boruta_speedup_sample_threshold
+        speedup_applied = threshold is not None and len(self.data.y) >= threshold
+
+        if not speedup_applied:
+            return {**defaults, 'speedup_applied': False, 'sample_threshold': threshold}
+
+        settings = {
+            'n_iterations': cfg.boruta_speedup_n_iterations or defaults['n_iterations'],
+            'n_estimators': cfg.boruta_speedup_n_estimators or defaults['n_estimators'],
+            'max_depth': cfg.boruta_speedup_max_depth,
+            'max_samples': cfg.boruta_speedup_max_samples,
+            'max_iter': cfg.boruta_speedup_max_iter or defaults['max_iter'],
+            'n_iter_no_change': cfg.boruta_speedup_n_iter_no_change or defaults['n_iter_no_change'],
+            'rf_n_jobs': cfg.boruta_speedup_rf_n_jobs,
+            'speedup_applied': True,
+            'sample_threshold': threshold,
+        }
+
+        assert settings['n_iterations'] > 0, 'Boruta n_iterations must be positive.'
+        assert settings['max_iter'] > 1, 'Boruta max_iter must be greater than one.'
+        assert settings['n_iter_no_change'] > 0, 'Boruta n_iter_no_change must be positive.'
+
+        if settings['n_estimators'] != 'auto':
+            assert settings['n_estimators'] > 0, 'Boruta n_estimators must be positive.'
+
+        if settings['max_depth'] is not None:
+            assert settings['max_depth'] > 0, 'Boruta max_depth must be positive.'
+
+        if settings['max_samples'] is not None:
+            assert 0 < settings['max_samples'] <= 1, 'Boruta max_samples must be in (0, 1].'
+
+        if settings['rf_n_jobs'] is not None:
+            assert settings['rf_n_jobs'] != 0, 'Boruta RF n_jobs must not be zero.'
+
+        return settings
 
     def _run_mrmr(self):
 

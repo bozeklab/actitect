@@ -118,6 +118,17 @@ class FeatureSelectionConfig(BaseConfig):
     fixed_features: Optional[List[str]] = None
     fair_agg: Optional[str] = None
 
+    # optionally skip or speedup boruta for large N of samples
+    use_boruta: bool = True
+    boruta_speedup_sample_threshold: Optional[int] = None
+    boruta_speedup_max_depth: Optional[int] = None
+    boruta_speedup_n_iterations: Optional[int] = None
+    boruta_speedup_n_estimators: Optional[int] = None
+    boruta_speedup_max_samples: Optional[float] = None
+    boruta_speedup_max_iter: Optional[int] = None
+    boruta_speedup_n_iter_no_change: Optional[int] = None
+    boruta_speedup_rf_n_jobs: Optional[int] = None
+
 
 @dataclass
 class ModelConfig(BaseConfig):
