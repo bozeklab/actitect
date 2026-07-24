@@ -13,8 +13,40 @@ from actitect import utils
 from ..processing.classification_threshold import get_operating_point, classify_with_threshold
 
 
-__all__ = ['perform_stratified_group_cv']
+__all__ = ['perform_group_cv', 'perform_stratified_group_cv']
 logger = logging.getLogger(__name__)
+
+
+def _validate_cv_splits(cv_splits, n_samples: int):
+    """Validate and materialize externally supplied cross-validation splits."""
+    validated_splits = []
+    for fold, split in enumerate(cv_splits):
+        if not isinstance(split, (tuple, list)) or len(split) != 2:
+            raise ValueError(f"Fold {fold}: each predefined split must be a (train_indices, validation_indices) pair.")
+
+        train_index = np.asarray(split[0], dtype=int)
+        val_index = np.asarray(split[1], dtype=int)
+
+        if train_index.ndim != 1 or val_index.ndim != 1:
+            raise ValueError(f"Fold {fold}: train and validation indices must be one-dimensional.")
+        if train_index.size == 0 or val_index.size == 0:
+            raise ValueError(f"Fold {fold}: train and validation sets must both be non-empty.")
+        if np.unique(train_index).size != train_index.size:
+            raise ValueError(f"Fold {fold}: train indices contain duplicates.")
+        if np.unique(val_index).size != val_index.size:
+            raise ValueError(f"Fold {fold}: validation indices contain duplicates.")
+        if np.any(train_index < 0) or np.any(train_index >= n_samples):
+            raise ValueError(f"Fold {fold}: train indices are outside the valid sample range [0, {n_samples}).")
+        if np.any(val_index < 0) or np.any(val_index >= n_samples):
+            raise ValueError(f"Fold {fold}: validation indices are outside the valid sample range [0, {n_samples}).")
+        if np.intersect1d(train_index, val_index).size:
+            raise ValueError(f"Fold {fold}: train and validation indices overlap.")
+
+        validated_splits.append((train_index, val_index))
+
+    if not validated_splits:
+        raise ValueError("At least one predefined CV split must be provided.")
+    return validated_splits
 
 
 @dataclass
@@ -24,7 +56,7 @@ class CVResults:
     history: dict = None
 
 
-def perform_stratified_group_cv(
+def perform_group_cv(
         model,
         x_train: np.ndarray,
         y_train: np.ndarray,
@@ -41,6 +73,7 @@ def perform_stratified_group_cv(
         debug_print: bool = False,
         dataset_weighting: str = None,
         ds_vector: np.ndarray = None,
+        cv_splits=None,
 ):
     """
     TODO: clean up function, some artifacts from non-parallelized version
@@ -64,6 +97,8 @@ def perform_stratified_group_cv(
         :param random_seed_splitting: (Optional, int) seed the splitter.
         :param verbose: (Optional, bool) whether to log info and results or not.
         :param debug_print: (Optional, bool) whether to print debug info.
+        :param cv_splits: (Optional, iterable) predefined ``(train_indices, validation_indices)`` pairs.
+            If omitted, splits are generated exactly as before using StratifiedGroupKFold.
 
     Returns:
         :return: CVResults
@@ -73,11 +108,17 @@ def perform_stratified_group_cv(
         assert patient_aggregation_function is not None, \
             "'patient_aggregation_function' must be provided if 'return_history' is True"
 
-    sgkf = model_selection.StratifiedGroupKFold(
-        n_splits=n_folds,
-        shuffle=shuffle,
-        random_state=random_seed_splitting,  # if set, same splits for each repeat
-    )
+    if cv_splits is None:
+        sgkf = model_selection.StratifiedGroupKFold(
+            n_splits=n_folds,
+            shuffle=shuffle,
+            random_state=random_seed_splitting,  # if set, same splits for each repeat
+        )
+        split_iterator = sgkf.split(x_train, y_strat, group)
+    else:
+        split_iterator = _validate_cv_splits(cv_splits=cv_splits, n_samples=x_train.shape[0])
+        if len(split_iterator) != n_folds:
+            raise ValueError(f"Expected {n_folds} predefined CV splits, got {len(split_iterator)}.")
 
     n_train_split = int((1 - 1 / n_folds) * x_train.shape[0])
     n_val_split = int((1 / n_folds) * x_train.shape[0])
@@ -279,7 +320,7 @@ def perform_stratified_group_cv(
             return_history, debug_print, mean_roc_fpr, _methods, _scoring_history_placeholder,
             dataset_weighting, ds_vector)
                               for k, (train_index, val_index)
-                              in enumerate(sgkf.split(x_train, y_strat, group)))
+                              in enumerate(split_iterator))
 
     # Initialize the dictionaries for aggregation
     scoring_history_per_night = {method: copy.deepcopy(_scoring_history_placeholder) for method in _methods}
@@ -333,6 +374,40 @@ def perform_stratified_group_cv(
                                   'misclassified_patients': misclassified_patients_per_fold})
     else:
         return CVResults(scoring=scoring, roc_curves=None, history=None)
+
+
+def perform_stratified_group_cv(
+        model,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        y_strat: np.ndarray,
+        group: np.ndarray,
+        use_early_stopping: bool,
+        n_folds: int,
+        shuffle: bool,
+        n_jobs: int,
+        random_seed_splitting: int = None,
+        patient_aggregation_function=None,
+        return_history: bool = False,
+        verbose: bool = False,
+        debug_print: bool = False,
+        dataset_weighting: str = None,
+        ds_vector: np.ndarray = None,
+        cv_splits=None,
+):
+    """Deprecated compatibility wrapper for :func:`perform_group_cv`."""
+    logger.warning(
+        "perform_stratified_group_cv() is deprecated and will be removed in a future release; "
+        "use perform_group_cv() instead."
+    )
+    return perform_group_cv(
+        model=model, x_train=x_train, y_train=y_train, y_strat=y_strat, group=group,
+        use_early_stopping=use_early_stopping, n_folds=n_folds, shuffle=shuffle, n_jobs=n_jobs,
+        random_seed_splitting=random_seed_splitting,
+        patient_aggregation_function=patient_aggregation_function, return_history=return_history,
+        verbose=verbose, debug_print=debug_print, dataset_weighting=dataset_weighting,
+        ds_vector=ds_vector, cv_splits=cv_splits,
+    )
 
 
 def perform_loocv(

@@ -30,7 +30,7 @@ from ..processing.metrics import calc_evaluation_metrics
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['KFoldNestedCV', 'LODONestedCV']
+__all__ = ['KFoldNestedCV', 'LODONestedCV', 'PredefinedKFoldNestedCV']
 
 
 class NestedCVBase(ABC):
@@ -90,13 +90,26 @@ class NestedCVBase(ABC):
         """Array passed as `groups=` to cv_iterator for the outer loop."""
         raise NotImplementedError('abstract method')
 
+    def _get_inner_splits(self, train_outer: Fold, *, repeat: int, outer_fold: int):
+        """Return predefined inner splits relative to ``train_outer``, or ``None`` for generated CV."""
+        return None
+
+    def _validate_data(self, data: FeatureSet):
+        """Validate data requirements specific to a Nested-CV flavour."""
+        return None
+
     def fit(self, data: FeatureSet):
 
         # post-init setup (needs data)
+        self._validate_data(data)
         self.n_datasets = self._count_unique_datasets(data)
-        self.n_repeats = 1 if isinstance(self, LODONestedCV) else self.config.nested_cv.n_repeats
-        self.outer_splits = self.n_datasets if isinstance(self, LODONestedCV) \
-            else self.config.nested_cv.outer_cv.n_splits
+        if isinstance(self, PredefinedKFoldNestedCV):
+            self.n_repeats = len(self.repeat_labels)
+            self.outer_splits = len(self.outer_fold_labels)
+        else:
+            self.n_repeats = 1 if isinstance(self, LODONestedCV) else self.config.nested_cv.n_repeats
+            self.outer_splits = self.n_datasets if isinstance(self, LODONestedCV) \
+                else self.config.nested_cv.outer_cv.n_splits
         self.inner_seeds = self._generate_random_seeds(self.random_state, self.n_repeats, self.outer_splits)
         if data.dataset is None:
             ds_summary = {"single": len(data.y)}
@@ -131,10 +144,13 @@ class NestedCVBase(ABC):
                 _rankings_root_dir = self.config.nested_cv.load_path_cv_feature_rankings.joinpath(
                     f"seed_{rank_seed}_{sys.platform}")
                 manifest.setdefault("rankings_root_dirs", {})[f"seed{outer_seed}"] = str(_rankings_root_dir)
-                _rank_kwargs = \
-                    {'root_dir': _rankings_root_dir, 'data_config': self.config.data, 'n_jobs': self.n_jobs,
-                     'fair_agg': self.config.model.feature_selection.fair_agg} \
-                        if not self.use_fixed_features else None
+                _rank_kwargs = {
+                    'root_dir': _rankings_root_dir,
+                    'data_config': self.config.data,
+                    'n_jobs': self.n_jobs,
+                    'fair_agg': self.config.model.feature_selection.fair_agg,
+                    'feature_selection_config': self.config.model.feature_selection,
+                } if not self.use_fixed_features else None
 
                 save_path_repeat = utils.check_make_dir(self.save_path.joinpath(
                     f"repeats/repeat{repeat}_seed{outer_seed}"), True)
@@ -209,10 +225,14 @@ class NestedCVBase(ABC):
                     fit_params.update({'dataset_weighting': self.ds_weighting_kwargs['mode'],
                                        'ds_vector': getattr(train_outer, 'dataset', None)})
 
+                repeat = outer_seed - self.random_state
+                inner_splits = self._get_inner_splits(
+                    train_for_bayes, repeat=repeat, outer_fold=k_outer)
                 opt_params, best_score = self._perform_inner_cv_bayes_opt(
                     outer_fold=train_for_bayes, model_setup=model_setup, rank_map=train_outer.feat_rank,
                     save_path=save_path_fold, fit_params=fit_params, inner_cv_seed=inner_seed,
-                    stratify_by_dataset=self.config.nested_cv.stratify_by_dataset_if_pooled)
+                    stratify_by_dataset=self.config.nested_cv.stratify_by_dataset_if_pooled,
+                    cv_splits=inner_splits)
 
             best_params = model_setup.bayesian_fixed_params.copy()
             best_params.update(opt_params)  # opt_params is empty if bayes skipped, so will fallback to library defaults
@@ -395,11 +415,11 @@ class NestedCVBase(ABC):
     @staticmethod
     def _perform_inner_cv_bayes_opt(outer_fold: Fold, model_setup: ModelSetup, rank_map: dict, fit_params: dict,
                                     save_path: Path, inner_cv_seed: int, stratify_by_dataset: bool,
-                                    plot_search_history: bool = True):
+                                    plot_search_history: bool = True, cv_splits=None):
         # run Bayesian Optimization on inner-cv:
         bayesian_opt = BayesianOptCV(model_setup=model_setup, feat_rank_map=rank_map, seed=inner_cv_seed)
         y_strat = outer_fold.get_strat_labels(stratify_by_dataset)
-        results = bayesian_opt.fit(outer_fold.x, outer_fold.y, y_strat, **fit_params)
+        results = bayesian_opt.fit(outer_fold.x, outer_fold.y, y_strat, **fit_params, cv_splits=cv_splits)
 
         opt_params = {dim.name: val for dim, val in zip(model_setup.bayesian_param_space, results.x)}
         logger.info(f"best score: {-results.fun:.3f} with params {utils.fmt_dict(opt_params, 3)}")
@@ -762,7 +782,8 @@ class NestedCVBase(ABC):
     def _restore_cv_state_from_manifest(self):
         """Restore key state variables for eval mode by reading manifest.json."""
         _is_lodo = isinstance(self, LODONestedCV)
-        _cv_tag = 'LODO' if _is_lodo else 'KFold'
+        _is_predefined = isinstance(self, PredefinedKFoldNestedCV)
+        _cv_tag = 'LODO' if _is_lodo else 'PredefinedKFold' if _is_predefined else 'KFold'
 
         # Try direct load: save_path points to a CV subdir
         manifest_path = self.save_path / 'manifest.json'
@@ -861,3 +882,307 @@ class LODONestedCV(NestedCVBase):
             out_path = summaries_dir / f"lodo_eval_summary_{variant_key}.json"
             with open(out_path, "w") as f:
                 json.dump(metric_summary, f, indent=2)
+
+
+class _PredefinedOuterSplitter:
+    """Minimal sklearn-compatible splitter backed by subject-level outer assignments."""
+
+    def __init__(self, assignments: pd.DataFrame, fold_labels: list[int]):
+        self.assignments = assignments.copy()
+        self.fold_labels = list(fold_labels)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self.fold_labels)
+
+    def split(self, X, y=None, groups=None):
+        if groups is None:
+            raise ValueError("Predefined outer splitting requires subject IDs via groups.")
+
+        groups = np.asarray(groups).astype(str)
+        available_subjects = set(groups)
+        for fold_label in self.fold_labels:
+            fold_df = self.assignments[self.assignments['outer_fold'] == fold_label]
+            train_subjects = set(fold_df.loc[fold_df['outer_role'] == 'train', 'subject_id'])
+            test_subjects = set(fold_df.loc[fold_df['outer_role'] == 'test', 'subject_id'])
+
+            missing = available_subjects.difference(train_subjects | test_subjects)
+            if missing:
+                raise ValueError(
+                    f"Outer fold {fold_label}: {len(missing)} loaded subjects have no predefined assignment; "
+                    f"examples: {sorted(missing)[:5]}"
+                )
+
+            train_indices = np.flatnonzero(np.isin(groups, list(train_subjects)))
+            test_indices = np.flatnonzero(np.isin(groups, list(test_subjects)))
+            if train_indices.size == 0 or test_indices.size == 0:
+                raise ValueError(
+                    f"Outer fold {fold_label}: predefined train and test partitions must both be non-empty.")
+            yield train_indices, test_indices
+
+
+class PredefinedKFoldNestedCV(NestedCVBase):
+    """Nested CV using predefined subject assignments for outer and inner folds.
+
+    ``splits`` must use long format with columns ``subject_id``, ``repeat``,
+    ``outer_fold``, ``inner_fold`` and ``role``. Roles must be ``train``,
+    ``validation`` or ``test``. Subject IDs must match ``FeatureSet.group`` exactly.
+    """
+
+    REQUIRED_SPLIT_COLUMNS = {'subject_id', 'repeat', 'outer_fold', 'inner_fold', 'role'}
+    VALID_ROLES = {'train', 'validation', 'test'}
+
+    def __init__(self, config: PipelineConfig, save_path: Path, splits: pd.DataFrame,
+                 early_stopping_options: list = None, calibration: str = None):
+        super().__init__(config, save_path, early_stopping_options=early_stopping_options, calibration=calibration)
+        self.split_assignments = self._prepare_split_assignments(splits)
+        self.repeat_labels = sorted(self.split_assignments['repeat'].unique().tolist())
+        self.outer_fold_labels = sorted(self.split_assignments['outer_fold'].unique().tolist())
+        self.inner_fold_labels = sorted(self.split_assignments['inner_fold'].unique().tolist())
+        self._validate_split_structure()
+        self._outer_assignments = self._build_outer_assignments()
+
+    @classmethod
+    def _prepare_split_assignments(cls, splits: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(splits, pd.DataFrame):
+            raise TypeError(f"splits must be a pandas DataFrame, got {type(splits).__name__}.")
+
+        missing_columns = cls.REQUIRED_SPLIT_COLUMNS.difference(splits.columns)
+        if missing_columns:
+            raise ValueError(f"Predefined splits are missing columns: {sorted(missing_columns)}")
+
+        prepared = splits.loc[:, sorted(cls.REQUIRED_SPLIT_COLUMNS)].copy()
+        if prepared.empty:
+            raise ValueError("Predefined splits must not be empty.")
+        if prepared.isna().any().any():
+            null_columns = prepared.columns[prepared.isna().any()].tolist()
+            raise ValueError(f"Predefined splits contain missing values in columns: {null_columns}")
+
+        prepared['subject_id'] = prepared['subject_id'].astype(str).str.strip()
+        prepared['role'] = prepared['role'].astype(str).str.strip().str.lower()
+        if (prepared['subject_id'] == '').any():
+            raise ValueError("Predefined splits contain empty subject IDs.")
+
+        for column in ['repeat', 'outer_fold', 'inner_fold']:
+            numeric = pd.to_numeric(prepared[column], errors='raise')
+            if not np.all(np.equal(numeric, np.floor(numeric))):
+                raise ValueError(f"Predefined split column '{column}' must contain integer values.")
+            prepared[column] = numeric.astype(int)
+            if (prepared[column] < 0).any():
+                raise ValueError(f"Predefined split column '{column}' must be non-negative.")
+
+        invalid_roles = set(prepared['role']).difference(cls.VALID_ROLES)
+        if invalid_roles:
+            raise ValueError(f"Unsupported predefined split roles: {sorted(invalid_roles)}")
+
+        duplicate_columns = ['subject_id', 'repeat', 'outer_fold', 'inner_fold']
+        duplicates = prepared.duplicated(duplicate_columns, keep=False)
+        if duplicates.any():
+            examples = prepared.loc[duplicates, duplicate_columns].head().to_dict('records')
+            raise ValueError(
+                "Predefined splits contain duplicate subject/repeat/outer_fold/inner_fold assignments; "
+                f"examples: {examples}")
+
+        return prepared.sort_values(['repeat', 'outer_fold', 'inner_fold', 'subject_id']).reset_index(drop=True)
+
+    def _validate_split_structure(self):
+        expected_repeats = list(range(len(self.repeat_labels)))
+        expected_outer = list(range(len(self.outer_fold_labels)))
+        expected_inner = list(range(len(self.inner_fold_labels)))
+        if self.repeat_labels != expected_repeats:
+            raise ValueError(f"Predefined repeat labels must be contiguous and zero-based, got {self.repeat_labels}.")
+        if self.outer_fold_labels != expected_outer:
+            raise ValueError(
+                f"Predefined outer-fold labels must be contiguous and zero-based, got {self.outer_fold_labels}.")
+        if self.inner_fold_labels != expected_inner:
+            raise ValueError(
+                f"Predefined inner-fold labels must be contiguous and zero-based, got {self.inner_fold_labels}.")
+        if len(self.inner_fold_labels) != self.config.nested_cv.inner_cv.n_splits:
+            raise ValueError(
+                f"Predefined splits define {len(self.inner_fold_labels)} inner folds, but pipeline config expects "
+                f"{self.config.nested_cv.inner_cv.n_splits}.")
+
+        all_subjects = set(self.split_assignments['subject_id'])
+        expected_combinations = {
+            (repeat, outer_fold, inner_fold)
+            for repeat in self.repeat_labels
+            for outer_fold in self.outer_fold_labels
+            for inner_fold in self.inner_fold_labels
+        }
+        actual_combinations = set(map(tuple, self.split_assignments[
+            ['repeat', 'outer_fold', 'inner_fold']].drop_duplicates().to_numpy()))
+        if actual_combinations != expected_combinations:
+            missing = sorted(expected_combinations.difference(actual_combinations))
+            extra = sorted(actual_combinations.difference(expected_combinations))
+            raise ValueError(f"Incomplete predefined split grid. Missing={missing[:5]}, extra={extra[:5]}.")
+
+        for (repeat, outer_fold, inner_fold), fold_df in self.split_assignments.groupby(
+                ['repeat', 'outer_fold', 'inner_fold'], sort=True):
+            fold_subjects = set(fold_df['subject_id'])
+            if fold_subjects != all_subjects:
+                missing = sorted(all_subjects.difference(fold_subjects))
+                extra = sorted(fold_subjects.difference(all_subjects))
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold} does not assign every "
+                    f"configured subject exactly once. Missing={missing[:5]}, extra={extra[:5]}.")
+
+            role_sets = {role: set(fold_df.loc[fold_df['role'] == role, 'subject_id']) for role in self.VALID_ROLES}
+            if not role_sets['train'] or not role_sets['validation'] or not role_sets['test']:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold} must contain non-empty "
+                    "train, validation and test partitions.")
+            if role_sets['train'] & role_sets['validation'] or role_sets['train'] & role_sets['test'] or \
+                    role_sets['validation'] & role_sets['test']:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold} contains overlapping roles.")
+
+        for (repeat, outer_fold), outer_df in self.split_assignments.groupby(['repeat', 'outer_fold'], sort=True):
+            test_sets = [
+                set(fold_df.loc[fold_df['role'] == 'test', 'subject_id'])
+                for _, fold_df in outer_df.groupby('inner_fold', sort=True)
+            ]
+            if any(test_set != test_sets[0] for test_set in test_sets[1:]):
+                raise ValueError(
+                    f"Outer-test subjects vary across inner folds for repeat={repeat}, outer_fold={outer_fold}.")
+
+        for repeat, repeat_df in self.split_assignments.groupby('repeat', sort=True):
+            outer_test_sets = []
+            for _, outer_df in repeat_df.groupby('outer_fold', sort=True):
+                first_inner = self.inner_fold_labels[0]
+                fold_df = outer_df[outer_df['inner_fold'] == first_inner]
+                outer_test_sets.append(set(fold_df.loc[fold_df['role'] == 'test', 'subject_id']))
+            if set().union(*outer_test_sets) != all_subjects:
+                missing = sorted(all_subjects.difference(set().union(*outer_test_sets)))
+                raise ValueError(f"Repeat {repeat}: outer-test folds do not cover all subjects; missing={missing[:5]}.")
+            for i, test_i in enumerate(outer_test_sets):
+                for j, test_j in enumerate(outer_test_sets[i + 1:], start=i + 1):
+                    overlap = test_i & test_j
+                    if overlap:
+                        raise ValueError(
+                            f"Repeat {repeat}: outer test folds {i} and {j} overlap; examples={sorted(overlap)[:5]}.")
+
+    def _build_outer_assignments(self) -> dict[int, pd.DataFrame]:
+        assignments = {}
+        for repeat in self.repeat_labels:
+            repeat_df = self.split_assignments[self.split_assignments['repeat'] == repeat]
+            rows = []
+            for (outer_fold, subject_id), subject_df in repeat_df.groupby(['outer_fold', 'subject_id'], sort=True):
+                roles = set(subject_df['role'])
+                if roles == {'test'}:
+                    outer_role = 'test'
+                elif 'test' not in roles and roles.issubset({'train', 'validation'}):
+                    outer_role = 'train'
+                else:
+                    raise ValueError(
+                        f"Inconsistent outer assignment for repeat={repeat}, outer_fold={outer_fold}, "
+                        f"subject={subject_id}: roles={sorted(roles)}")
+                rows.append({'subject_id': subject_id, 'outer_fold': outer_fold, 'outer_role': outer_role})
+            assignments[repeat] = pd.DataFrame(rows)
+        return assignments
+
+    def _validate_data(self, data: FeatureSet):
+        if data.group is None:
+            raise ValueError("Predefined nested CV requires subject IDs in FeatureSet.group.")
+        groups = np.asarray(data.group).astype(str)
+        if groups.ndim != 1 or len(groups) != len(data.y):
+            raise ValueError("FeatureSet.group must be one-dimensional and aligned with FeatureSet.y.")
+
+        loaded_subjects = set(groups)
+        configured_subjects = set(self.split_assignments['subject_id'])
+        loaded_but_unconfigured = loaded_subjects.difference(configured_subjects)
+        configured_but_not_loaded = configured_subjects.difference(loaded_subjects)
+        if loaded_but_unconfigured or configured_but_not_loaded:
+            raise ValueError(
+                "Loaded subjects and predefined split subjects do not match exactly. "
+                f"Loaded but unconfigured: {len(loaded_but_unconfigured)} "
+                f"(examples: {sorted(loaded_but_unconfigured)[:5]}); configured but not loaded: "
+                f"{len(configured_but_not_loaded)} (examples: {sorted(configured_but_not_loaded)[:5]}).")
+
+        y = np.asarray(data.y)
+        inconsistent_labels = [subject for subject in loaded_subjects if np.unique(y[groups == subject]).size != 1]
+        if inconsistent_labels:
+            raise ValueError(
+                f"Each subject must have exactly one label; inconsistent subjects: {sorted(inconsistent_labels)[:5]}")
+
+        if data.dataset is not None:
+            datasets = np.asarray(data.dataset).astype(str)
+            if datasets.ndim != 1 or len(datasets) != len(data.y):
+                raise ValueError("FeatureSet.dataset must be one-dimensional and aligned with FeatureSet.y.")
+            inconsistent_datasets = [
+                subject for subject in loaded_subjects if np.unique(datasets[groups == subject]).size != 1
+            ]
+            if inconsistent_datasets:
+                raise ValueError(
+                    "Each subject must belong to exactly one dataset; inconsistent subjects: "
+                    f"{sorted(inconsistent_datasets)[:5]}")
+
+        for repeat in self.repeat_labels:
+            outer_splitter = _PredefinedOuterSplitter(self._outer_assignments[repeat], self.outer_fold_labels)
+            outer_splits = list(outer_splitter.split(data.x, data.y, groups))
+            if len(outer_splits) != len(self.outer_fold_labels):
+                raise ValueError(f"Repeat {repeat}: expected {len(self.outer_fold_labels)} outer folds.")
+            for outer_fold, (train_idx, test_idx) in zip(self.outer_fold_labels, outer_splits):
+                train_subjects = set(groups[train_idx])
+                test_subjects = set(groups[test_idx])
+                if train_subjects & test_subjects:
+                    raise ValueError(f"Repeat {repeat}, outer fold {outer_fold}: train/test subjects overlap.")
+                if train_subjects | test_subjects != loaded_subjects:
+                    raise ValueError(
+                        f"Repeat {repeat}, outer fold {outer_fold}: train/test subjects do not cover data.")
+
+        logger.info(
+            f"Validated predefined nested-CV splits for {len(loaded_subjects)} subjects, "
+            f"{len(self.repeat_labels)} repeats, {len(self.outer_fold_labels)} outer folds and "
+            f"{len(self.inner_fold_labels)} inner folds.")
+
+    def _get_outer_splitter(self, seed: int):
+        repeat = seed - self.random_state
+        if repeat not in self._outer_assignments:
+            raise ValueError(f"No predefined assignments found for repeat {repeat}.")
+        return _PredefinedOuterSplitter(self._outer_assignments[repeat], self.outer_fold_labels)
+
+    def _get_outer_groups(self, data: FeatureSet):
+        return data.group
+
+    def _get_inner_splits(self, train_outer: Fold, *, repeat: int, outer_fold: int):
+        groups = np.asarray(train_outer.group).astype(str)
+        available_subjects = set(groups)
+        split_df = self.split_assignments[
+            (self.split_assignments['repeat'] == repeat) &
+            (self.split_assignments['outer_fold'] == outer_fold)
+            ]
+        if split_df.empty:
+            raise ValueError(f"No predefined inner assignments for repeat={repeat}, outer_fold={outer_fold}.")
+
+        cv_splits = []
+        for inner_fold in self.inner_fold_labels:
+            fold_df = split_df[split_df['inner_fold'] == inner_fold]
+            train_subjects = set(fold_df.loc[fold_df['role'] == 'train', 'subject_id'])
+            validation_subjects = set(fold_df.loc[fold_df['role'] == 'validation', 'subject_id'])
+            test_subjects = set(fold_df.loc[fold_df['role'] == 'test', 'subject_id'])
+
+            unexpected_test = available_subjects.intersection(test_subjects)
+            if unexpected_test:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold}: outer-test subjects are "
+                    f"present in the outer-training fold; examples: {sorted(unexpected_test)[:5]}")
+
+            assigned_outer_train = train_subjects | validation_subjects
+            missing = available_subjects.difference(assigned_outer_train)
+            extra = assigned_outer_train.difference(available_subjects)
+            if missing or extra:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold}: inner assignments do not "
+                    f"match outer-training subjects. Missing={sorted(missing)[:5]}, extra={sorted(extra)[:5]}.")
+            if train_subjects & validation_subjects:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold}: train/validation overlap.")
+
+            train_indices = np.flatnonzero(np.isin(groups, list(train_subjects)))
+            validation_indices = np.flatnonzero(np.isin(groups, list(validation_subjects)))
+            if train_indices.size == 0 or validation_indices.size == 0:
+                raise ValueError(
+                    f"repeat={repeat}, outer_fold={outer_fold}, inner_fold={inner_fold}: predefined train and "
+                    "validation partitions must both be non-empty.")
+            cv_splits.append((train_indices, validation_indices))
+
+        return cv_splits

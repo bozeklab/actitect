@@ -8,7 +8,7 @@ from sklearn.model_selection import ParameterGrid, ParameterSampler
 from skopt import gp_minimize
 
 from actitect.utils import custom_tqdm
-from .cross_validation import perform_stratified_group_cv
+from .cross_validation import perform_group_cv
 from ..models import ModelSetup
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class BaseGridSearchCV(ABC):
                 params = self.fixed_params.copy()
                 params.update(_grid_point)
                 self.model.set_params(**params)
-                _cv_results = perform_stratified_group_cv(self.model, x, y, group, cv_folds, cv_repeats, False)
+                _cv_results = perform_group_cv(self.model, x, y, group, cv_folds, cv_repeats, False)
                 _score = sum(self.cv_score_weights[metric] * _cv_results[metric]['mean'] for metric in _cv_results)
                 # potential improvements: use geometric mean, including
 
@@ -157,13 +157,14 @@ class BayesianOptCV:
 
     @staticmethod
     def _objective(_x, _y, _y_strat, _model, _params, _fixed_params, _cv_params, _score_weights, _use_early_stopping,
-                   _seed, _n_jobs, _dataset_weighting, _ds_vector):
+                   _seed, _n_jobs, _dataset_weighting, _ds_vector, _cv_splits=None):
         _params.update(_fixed_params)
         _model.set_params(**_params)
-        _cv_results = perform_stratified_group_cv(_model, _x, _y, _y_strat, **_cv_params,
-                                                  use_early_stopping=_use_early_stopping,
-                                                  random_seed_splitting=_seed, n_jobs=_n_jobs,
-                                                  dataset_weighting=_dataset_weighting, ds_vector=_ds_vector)
+        _cv_results = perform_group_cv(_model, _x, _y, _y_strat, **_cv_params,
+                                       use_early_stopping=_use_early_stopping,
+                                       random_seed_splitting=_seed, n_jobs=_n_jobs,
+                                       dataset_weighting=_dataset_weighting, ds_vector=_ds_vector,
+                                       cv_splits=_cv_splits)
 
         _score = (_cv_results.scoring['night']['default_thresh']['f1']['mean']
                   + _cv_results.scoring['night']['default_thresh']['auc']['mean']) / 2
@@ -171,7 +172,7 @@ class BayesianOptCV:
         return -_score  # for gp_minimize minus is needed
 
     def fit(self, x, y, y_strat, cv_params, n_calls: int, use_early_stopping: bool, n_jobs: int,
-            dataset_weighting: str = None, ds_vector: np.ndarray = None,  verbose: bool = True):
+            dataset_weighting: str = None, ds_vector: np.ndarray = None, verbose: bool = True, cv_splits=None):
 
         self.dataset_weighting = dataset_weighting
         self.ds_vector = ds_vector
@@ -193,7 +194,8 @@ class BayesianOptCV:
                     x_sel_feats = x
                 return self._objective(x_sel_feats, y, y_strat, self.model, param_dict, self.fixed_params, cv_params,
                                        self.cv_score_weights, use_early_stopping, _seed=self.seed, _n_jobs=n_jobs,
-                                       _dataset_weighting=self.dataset_weighting, _ds_vector=self.ds_vector)
+                                       _dataset_weighting=self.dataset_weighting, _ds_vector=self.ds_vector,
+                                       _cv_splits=cv_splits)
 
         optimizer_kwargs = {
             'n_calls': n_calls,  # (int, 100)
