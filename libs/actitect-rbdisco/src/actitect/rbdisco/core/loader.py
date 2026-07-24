@@ -430,31 +430,31 @@ class DataLoader:
         return n_hc_train, n_rbd_train, n_hc_test, n_rbd_test
 
     @staticmethod
-    def _infer_dataset_dir_mapping(meta_df: pd.DataFrame, patient_dirs: List[Path]) -> dict:
+    def _infer_dataset_dir_mapping(meta_df: pd.DataFrame, patient_root_dirs: List[Path]) -> dict:
         """Get mapping from dataset_id to patient_dir using file existence checks.
          Allows multiple dataset_ids to share the same directory."""
         dir_to_dataset_ids = defaultdict(set)
-        for p_dir in patient_dirs:
+        for p_dir in patient_root_dirs:
             for _, row in meta_df.iterrows():
                 full_path = p_dir / row['ID']
                 if full_path.exists():
                     dir_to_dataset_ids[p_dir].add(row['dataset_id'])
 
-        patient_dir_to_dataset_id = {}
+        patient_root_dir_to_dataset_id = {}
         for p_dir, ds_ids in dir_to_dataset_ids.items():
             if len(ds_ids) != 1:
                 logger.warning(f"Directory {p_dir} maps to multiple dataset_ids: {ds_ids}")
             for ds_id in ds_ids:
-                patient_dir_to_dataset_id[ds_id] = p_dir
+                patient_root_dir_to_dataset_id[ds_id] = p_dir
 
-        mapped_dataset_ids = set(patient_dir_to_dataset_id.keys())
+        mapped_dataset_ids = set(patient_root_dir_to_dataset_id.keys())
         all_dataset_ids = set(meta_df['dataset_id'].unique())
 
         if mapped_dataset_ids != all_dataset_ids:
             missing = all_dataset_ids - mapped_dataset_ids
-            raise ValueError(f"No matching patient_dir found for dataset_ids: {missing}")
+            raise ValueError(f"No matching patient_root_dir found for dataset_ids: {missing}")
 
-        return patient_dir_to_dataset_id
+        return patient_root_dir_to_dataset_id
 
     def _create_local_feature_dataframe(self, util_cols: List[str] = None):
         if self.verbose:

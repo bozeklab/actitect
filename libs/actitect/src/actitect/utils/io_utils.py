@@ -283,20 +283,24 @@ def read_meta_csv_to_df(path_to_csv: Path, exclude: bool = False, verbose: bool 
         """
         if tokens is None:
             tokens = ("total", "subtotal", "sum", "gesamt", "Σ", "note", "notes", "comment")
-        tokens = tuple(t.lower() for t in tokens)
 
-        # (A) token hit anywhere (string cells)
+        token_patterns = [
+            re.compile(rf"(?<!\w){re.escape(str(token))}(?!\w)", flags=re.IGNORECASE)
+            for token in tokens
+        ]
+
         str_df = df.astype(object).where(
             ~df.apply(lambda col: col.map(lambda x: isinstance(x, (list, dict, set))))
         )
-        # Lowercase only strings
-        str_mask = str_df.apply(lambda col: col.map(lambda x: str(x).lower() if isinstance(x, str) else x))
 
-        # Token detection
-        token_hit = str_mask.apply(
-            lambda r: any(isinstance(v, str) and any(t in v for t in tokens) for v in r),
-            axis=1
+        token_hit = str_df.apply(
+            lambda row: any(
+                isinstance(value, str) and any(pattern.search(value) for pattern in token_patterns)
+                for value in row
+            ),
+            axis=1,
         )
+
         # (B) numeric-aggregate match (sum or count)
         num_cols = df.select_dtypes(include=[np.number]).columns
         if len(num_cols):
