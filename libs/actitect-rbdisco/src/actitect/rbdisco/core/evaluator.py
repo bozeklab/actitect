@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Union
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from sklearn import metrics
 
@@ -23,8 +24,9 @@ logger = logging.getLogger(__name__)
 class Evaluator:
 
     def __init__(self, save_path: Path, experiment: ExperimentConfig, thresholds: dict,
-                 cv_mode: bool, output_patient_csv: bool = False, cv_config: NestedCVConfig = None, *,
-                 bootstrap_ci: bool = False, extra_diagnostic_metrics: bool = False):
+                 cv_mode: bool, output_patient_csv: bool = False, output_night_csv: bool = False,
+                 cv_config: NestedCVConfig = None, *, bootstrap_ci: bool = False,
+                 extra_diagnostic_metrics: bool = False):
 
         self.save_path = save_path
         self.experiment = experiment
@@ -32,7 +34,8 @@ class Evaluator:
         self.cv_mode = cv_mode
         self.bootstrap_ci = bootstrap_ci
         self.cv_config = cv_config
-        self.output_patient_csv = False if self.cv_mode else output_patient_csv
+        self.output_patient_csv = output_patient_csv
+        self.output_night_csv = output_night_csv
         self.extra_diagnostic_metrics = extra_diagnostic_metrics
         if cv_mode:
             assert cv_config, f"if 'cv_mode' is True, 'cv_config' must be passed as 'NestedCVConfig' instance."
@@ -49,8 +52,11 @@ class Evaluator:
             assert train_data.prob is not None, \
                 f"if 'train_data' is provided, the '{type(train_data)}' needs to have values assigned to '.prob'."
 
+        night_threshold = self.thresholds.get('night')
+        if self.output_night_csv:
+            self._save_night_level_predictions_csv(valid_data, night_threshold)
+
         if generate_night_output:  # save night level evaluation
-            night_threshold = self.thresholds.get('night')
             save_path_night = utils.check_make_dir(self.save_path.joinpath('night'), True, verbose=False)
             scores_night = self._evaluate_night_level(
                 train_data, valid_data, night_threshold, save_path_night)
@@ -102,8 +108,10 @@ class Evaluator:
         per_patient_df = aggregate_night_predictions_to_patient_level(
             valid_data, y_pred=y_pred_valid_night, kwargs=_agg_kwargs)
 
-        if not self.cv_mode and output_csv:
-            self._save_patient_level_predictions_csv(per_patient_df, valid_data)
+        if output_csv:
+            self._save_patient_level_predictions_csv(
+                per_patient_df, valid_data, night_threshold=night_threshold, patient_threshold=patient_threshold)
+
 
         patient_agg = self.experiment.patient_aggregation  # e.g., "ensemble_major"
 
@@ -147,20 +155,98 @@ class Evaluator:
         misclassified_counts.update({'note': 'if SMOTE is used, n_nights > 7 is possible for train set.'})
         return misclassified_counts
 
-    def _save_patient_level_predictions_csv(self, per_patient_df: pd.DataFrame, valid_data: Union[FeatureSet, Fold]):
-        """ Saves a CSV file for patient-level predictions for a given combination of night and patient thresholds. """
-        nightly_probs_df = pd.DataFrame({'id': valid_data.group, 'prob': valid_data.prob})
-        nightly_probs_df = (nightly_probs_df.groupby('id')['prob'].apply(lambda x: ','.join(map(str, x.tolist())))
-                            .reset_index().rename(columns={'prob': 'nightly_probs'}))
+    def _save_night_level_predictions_csv(self, valid_data: Union[FeatureSet, Fold],
+                                          night_threshold: ClassThreshold):
+        """Save one row per evaluated real night, including row-aligned sample metadata."""
+        y_pred = classify_with_threshold(valid_data.prob, night_threshold.value)
+        n_rows = len(valid_data.y)
 
-        merged_df = per_patient_df.merge(nightly_probs_df, on='id', how='left')
+        smote_mask = getattr(valid_data, 'smote_mask', None)
+        if smote_mask is not None and np.asarray(smote_mask, dtype=bool).any():
+            raise ValueError('Night prediction export received synthetic SMOTE validation samples.')
+
+        metadata = getattr(valid_data, 'metadata', None)
+        if metadata is None:
+            prediction_df = pd.DataFrame(index=np.arange(n_rows))
+        else:
+            if len(metadata) != n_rows:
+                raise ValueError(
+                    f'Night prediction metadata has {len(metadata)} rows, but validation data has {n_rows} samples.'
+                )
+            prediction_df = metadata.reset_index(drop=True).copy()
+
+        prediction_df.insert(0, 'sample_index', np.arange(n_rows))
+        prediction_df['subject_id'] = valid_data.group
+        prediction_df['ground_truth'] = valid_data.y
+        prediction_df['night_probability'] = valid_data.prob
+        prediction_df['night_prediction'] = y_pred
+        prediction_df['night_threshold'] = night_threshold.value
+
+        dataset = getattr(valid_data, 'dataset', None)
+        if dataset is not None:
+            prediction_df['site'] = dataset
+
+        if 'night_id' in prediction_df.columns:
+            duplicates = prediction_df['night_id'].duplicated(keep=False)
+            if duplicates.any():
+                examples = prediction_df.loc[duplicates, ['night_id', 'subject_id']].head(10)
+                raise ValueError(
+                    'Duplicate night identifiers found in one prediction export:\n'
+                    f'{examples.to_string(index=False)}'
+                )
+
+        preferred_columns = [
+            'sample_index', 'night_id', 'subject_id', 'site', 'record_id', 'record_key', 'night',
+            'sptw_idx', 'sptw_start', 'sptw_end', 'sptw_duration_hours', 'source_feature_file',
+            'is_synthetic', 'ground_truth', 'night_probability', 'night_prediction', 'night_threshold',
+        ]
+        ordered_columns = [column for column in preferred_columns if column in prediction_df.columns]
+        ordered_columns += [column for column in prediction_df.columns if column not in ordered_columns]
+        prediction_df = prediction_df[ordered_columns]
+
+        csv_path = self.save_path.joinpath(f"{self.experiment.name}_night_predictions.csv")
+        prediction_df.to_csv(csv_path, index=False)
+        logger.info(f"Saved night-level predictions CSV to {csv_path}")
+
+    def _save_patient_level_predictions_csv(self, per_patient_df: pd.DataFrame,
+                                            valid_data: Union[FeatureSet, Fold], *,
+                                            night_threshold: ClassThreshold,
+                                            patient_threshold: ClassThreshold):
+        """Save one row per patient plus the contributing nightly probabilities."""
+        nightly_df = pd.DataFrame({'id': valid_data.group, 'prob': valid_data.prob})
+        nightly_summary = nightly_df.groupby('id')['prob'].agg(
+            n_nights='size',
+            nightly_probs=lambda values: ','.join(map(str, values.tolist())),
+        ).reset_index()
+
+        merged_df = per_patient_df.merge(nightly_summary, on='id', how='left')
         agg_col = f"pred({self.experiment.patient_aggregation})"
-        columns = ['id', 'ground_truth', 'mean_prob_per_night']
-        if agg_col in merged_df.columns:
-            columns.append(agg_col)
-        columns.append('nightly_probs')
+        merged_df = merged_df.rename(columns={
+            'id': 'subject_id',
+            'mean_prob_per_night': 'patient_probability',
+            agg_col: 'patient_prediction',
+        })
+        merged_df['night_threshold'] = night_threshold.value
+        merged_df['patient_threshold'] = patient_threshold.value
+        merged_df['patient_aggregation'] = self.experiment.patient_aggregation
 
-        # Save the CSV file using a simplified naming scheme based on the experiment name
+        dataset = getattr(valid_data, 'dataset', None)
+        if dataset is not None:
+            subject_site = (pd.DataFrame({'subject_id': valid_data.group, 'site': dataset})
+                            .drop_duplicates())
+            site_counts = subject_site.groupby('subject_id')['site'].nunique()
+            if site_counts.gt(1).any():
+                logger.warning('Some patients map to multiple datasets; patient prediction CSV will contain duplicates.')
+            merged_df = merged_df.merge(subject_site, on='subject_id', how='left')
+
+        columns = ['subject_id']
+        if 'site' in merged_df.columns:
+            columns.append('site')
+        columns += ['ground_truth', 'n_nights', 'patient_probability']
+        if 'patient_prediction' in merged_df.columns:
+            columns.append('patient_prediction')
+        columns += ['night_threshold', 'patient_threshold', 'patient_aggregation', 'nightly_probs']
+
         csv_path = self.save_path.joinpath(f"{self.experiment.name}_patient_predictions.csv")
         merged_df[columns].to_csv(csv_path, index=False)
         logger.info(f"Saved patient-level predictions CSV to {csv_path}")

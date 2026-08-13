@@ -216,6 +216,7 @@ class NestedCVConfig(BaseConfig):
     load_path_cv_feature_rankings: Union[str, Path] = None
     ranking_seed: int = None  # defaults to global random state
     extra_diagnostic_metrics: bool = False
+    output_predictions: bool = False
 
 
 @dataclass

@@ -395,8 +395,13 @@ class NestedCVBase(ABC):
                     if _valid_set.x.size == 0:  # nothing to score after filtering
                         continue
                     _out_dir = utils.check_make_dir(save_path_fold.joinpath(_save_tag), True)
+                    # Export raw predictions only for the primary, unfiltered validation set.
+                    # The minimum-night sensitivity subset contains duplicate samples.
+                    _output_predictions = self.config.nested_cv.output_predictions and _save_tag == _suffix
                     ev = Evaluator(_out_dir, self.config.nested_cv.default_experiment, thresholds,
                                    cv_config=self.config.nested_cv, cv_mode=True,
+                                   output_patient_csv=_output_predictions,
+                                   output_night_csv=_output_predictions,
                                    bootstrap_ci=isinstance(self, LODONestedCV),
                                    extra_diagnostic_metrics=bool(self.config.nested_cv.extra_diagnostic_metrics))
                     ev.evaluate(

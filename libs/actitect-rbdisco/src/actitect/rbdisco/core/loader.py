@@ -116,6 +116,7 @@ class DataLoader:
 
         local_feat_df = self._create_local_feature_dataframe()
         x, y, y_str, feat_map, train_index_mask, test_index_mask = None, None, None, None, None, None
+        sample_metadata = None
 
         if agg_level == 'move':
             _feature_df = local_feat_df[self.included_local_features]
@@ -146,6 +147,7 @@ class DataLoader:
         else:
 
             feat_df_night = self._create_global_feature_dataframe(local_feat_df.copy(), use_numba=agg_with_numba)
+            feat_df_night = self._attach_night_metadata(feat_df_night, local_feat_df)
 
             if agg_level == 'night':
                 _included_local_features = [
@@ -155,6 +157,7 @@ class DataLoader:
                 feat_map = _feature_df.columns.values
                 x = _feature_df.to_numpy()
                 y = feat_df_night.ground_truth
+                sample_metadata = self._build_night_sample_metadata(feat_df_night)
                 y_str = feat_df_night.diagnosis if self.add_str_labels else None
                 train_index_mask = feat_df_night.record_key.isin(self.records_train)
                 test_index_mask = feat_df_night.record_key.isin(self.records_test)
@@ -224,6 +227,8 @@ class DataLoader:
         x_train = np.array(x[train_index_mask])
         y_train = np.array(y[train_index_mask])
         y_str_train = np.array(y_str[train_index_mask]) if self.add_str_labels else None
+        metadata_train = (sample_metadata.loc[train_index_mask].reset_index(drop=True).copy()
+                          if sample_metadata is not None else None)
 
         logger.warning(f"n records_test = {len(self.records_test)}")
         logger.warning(f"records_test sample = {list(self.records_test[:10])}")
@@ -243,6 +248,8 @@ class DataLoader:
         x_test = np.array(x[test_index_mask])
         y_test = np.array(y[test_index_mask])
         y_str_test = np.array(y_str[test_index_mask]) if self.add_str_labels else None
+        metadata_test = (sample_metadata.loc[test_index_mask].reset_index(drop=True).copy()
+                         if sample_metadata is not None else None)
 
         self._assert_binary_labels(y_train, 'y_train')
         self._assert_binary_labels(y_test, 'y_test')
@@ -289,11 +296,13 @@ class DataLoader:
 
         train_set = FeatureSet(
             x=x_train, y=y_train, y_str=y_str_train,  # data and labels
-            group=self.train_group_map, feat_map=feat_map, dataset=train_dataset_ids  # mappings
+            group=self.train_group_map, feat_map=feat_map, dataset=train_dataset_ids,  # mappings
+            metadata=metadata_train
         )
         test_set = FeatureSet(
             x=x_test, y=y_test, y_str=y_str_test,
-            group=self.test_group_map, feat_map=feat_map, dataset=test_dataset_ids
+            group=self.test_group_map, feat_map=feat_map, dataset=test_dataset_ids,
+            metadata=metadata_test
         )
 
         return train_set, test_set, class_weights_train
@@ -682,6 +691,81 @@ class DataLoader:
             global_feat_df, drop=True, replace=None, df_log_name='global_feat_df',
             excluded_cols=['record_key', 'id', 'record_id', 'diagnosis', 'ground_truth', 'block_id'],
             verbose=self.verbose)
+
+    @staticmethod
+    def _attach_night_metadata(feat_df_night: pd.DataFrame, local_feat_df: pd.DataFrame) -> pd.DataFrame:
+        """Attach one validated metadata row to each aggregated record/night sample.
+
+        Metadata are reconstructed from the local feature rows using the same
+        ``record_key``/``night`` keys used for feature aggregation. Any conflicting
+        metadata values within one aggregated night raise immediately rather than being
+        resolved silently.
+        """
+        key_columns = ['record_key', 'night']
+        candidate_columns = [
+            'id', 'record_id', 'sptw_idx', 'sptw_start', 'sptw_end', 'ident'
+        ]
+        metadata_columns = [column for column in candidate_columns if column in local_feat_df.columns]
+        if not metadata_columns:
+            return feat_df_night
+
+        grouped = local_feat_df.groupby(key_columns, sort=False, dropna=False)
+        conflicts = grouped[metadata_columns].nunique(dropna=False).gt(1)
+        if conflicts.any().any():
+            bad_groups = conflicts.any(axis=1)
+            examples = [tuple(index) for index in conflicts.index[bad_groups][:10]]
+            bad_columns = conflicts.loc[bad_groups].any(axis=0)
+            raise ValueError(
+                'Conflicting night metadata found within aggregated record/night groups. '
+                f'columns={bad_columns[bad_columns].index.tolist()}, examples={examples}'
+            )
+
+        night_metadata = grouped[metadata_columns].first().reset_index()
+        add_columns = [column for column in metadata_columns if column not in feat_df_night.columns]
+        if add_columns:
+            feat_df_night = feat_df_night.merge(
+                night_metadata[key_columns + add_columns],
+                on=key_columns,
+                how='left',
+                validate='one_to_one',
+            )
+
+        return feat_df_night
+
+    @staticmethod
+    def _build_night_sample_metadata(feat_df_night: pd.DataFrame) -> pd.DataFrame:
+        """Create row-aligned metadata for night-level FeatureSet samples."""
+        metadata = pd.DataFrame(index=feat_df_night.index)
+        metadata['subject_id'] = feat_df_night['id'].astype(str)
+        metadata['record_id'] = feat_df_night['record_id'] if 'record_id' in feat_df_night else None
+        metadata['record_key'] = feat_df_night['record_key'].astype(str)
+        metadata['night'] = feat_df_night['night']
+
+        for column in ('sptw_idx', 'sptw_start', 'sptw_end'):
+            metadata[column] = feat_df_night[column] if column in feat_df_night else pd.NA
+
+        for column in ('sptw_start', 'sptw_end'):
+            metadata[column] = pd.to_datetime(metadata[column], errors='coerce')
+
+        metadata['sptw_duration_hours'] = (
+            metadata['sptw_end'] - metadata['sptw_start']
+        ).dt.total_seconds() / 3600.0
+        metadata['source_feature_file'] = (
+            feat_df_night['ident'].astype(str) if 'ident' in feat_df_night else pd.NA
+        )
+        metadata['night_id'] = (
+            metadata['record_key'].astype(str)
+            + '|night='
+            + metadata['night'].astype(str)
+        )
+        metadata['is_synthetic'] = False
+
+        duplicates = metadata['night_id'].duplicated(keep=False)
+        if duplicates.any():
+            examples = metadata.loc[duplicates, ['night_id', 'sptw_start', 'sptw_end']].head(10)
+            raise ValueError(f'Duplicate night_id values found:\n{examples.to_string(index=False)}')
+
+        return metadata.reset_index(drop=True)
 
     def _create_global_feature_dataframe(self, local_df_copy: pd.DataFrame, use_numba: bool = True,
                                          return_structure_only: bool = False, global_only: bool = False):

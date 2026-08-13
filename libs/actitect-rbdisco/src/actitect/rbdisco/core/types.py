@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Union
 
 import numpy as np
+import pandas as pd
 from sklearn import preprocessing
 
 from actitect import utils
@@ -41,6 +42,60 @@ class FeatureSet:
     from_fold: Optional[dict] = field(default=None)
     # optional, mapping between the instance and the corresponding dataset, only relevant for multi-center model
     dataset: Optional[np.ndarray] = field(default=None)  # shape = (n_samples,)
+    # optional row-aligned sample metadata. Each row must describe exactly one sample in x.
+    metadata: Optional[pd.DataFrame] = field(default=None)
+
+    def __post_init__(self):
+        self._validate_sample_alignment()
+
+    def _validate_sample_alignment(self):
+        """Validate that all sample-aligned attributes match the number of rows in x."""
+        n_samples = int(self.x.shape[0])
+        for name in ('y', 'group', 'smote_mask', 'prob', 'y_str', 'dataset'):
+            value = getattr(self, name)
+            if value is not None and len(value) != n_samples:
+                raise ValueError(
+                    f"FeatureSet.{name} has length {len(value)}, but x has {n_samples} samples."
+                )
+
+        if self.metadata is not None:
+            if not isinstance(self.metadata, pd.DataFrame):
+                raise TypeError("FeatureSet.metadata must be a pandas DataFrame or None.")
+            if len(self.metadata) != n_samples:
+                raise ValueError(
+                    f"FeatureSet.metadata has {len(self.metadata)} rows, but x has {n_samples} samples."
+                )
+            self.metadata = self.metadata.reset_index(drop=True).copy()
+
+    @staticmethod
+    def _expand_metadata_after_smote(metadata: Optional[pd.DataFrame], smote_mask: np.ndarray) -> Optional[pd.DataFrame]:
+        """Expand real-sample metadata to a SMOTE-resampled sample order.
+
+        Synthetic samples intentionally receive missing source metadata and are marked via
+        ``is_synthetic=True``. The helper assumes the mask returned by
+        ``apply_smote_with_group_mapping`` is aligned with the resampled arrays.
+        """
+        if metadata is None:
+            return None
+
+        mask = np.asarray(smote_mask, dtype=bool)
+        n_original = int((~mask).sum())
+        if len(metadata) != n_original:
+            raise ValueError(
+                f"Cannot expand metadata after SMOTE: {len(metadata)} metadata rows for "
+                f"{n_original} original samples."
+            )
+
+        original = metadata.reset_index(drop=True).copy()
+        if 'is_synthetic' not in original.columns:
+            original['is_synthetic'] = False
+        else:
+            original['is_synthetic'] = False
+
+        expanded = pd.DataFrame(index=np.arange(len(mask)), columns=original.columns)
+        expanded.loc[~mask, original.columns] = original.to_numpy()
+        expanded['is_synthetic'] = mask
+        return expanded.reset_index(drop=True)
 
     def __str__(self):
         ds = set(self.dataset) if self.dataset is not None else None
@@ -112,6 +167,7 @@ class FeatureSet:
             y_str=self.y_str,
             from_fold=self.from_fold,
             feat_rank=self.feat_rank,
+            metadata=self.metadata.copy() if self.metadata is not None else None,
         )
 
     def select_samples(self, sample_indices):
@@ -127,9 +183,14 @@ class FeatureSet:
         new_dataset = self.dataset[sample_indices] if self.dataset is not None else None
         new_smote_mask = self.smote_mask[sample_indices] if self.smote_mask is not None else None
         new_y_str = self.y_str[sample_indices] if self.y_str is not None else None
+        new_metadata = None
+        if self.metadata is not None:
+            selected_positions = np.arange(len(self.x))[sample_indices]
+            selected_positions = np.atleast_1d(selected_positions)
+            new_metadata = self.metadata.iloc[selected_positions].reset_index(drop=True).copy()
         return FeatureSet(x=new_x, y=new_y, group=new_group, feat_map=self.feat_map, process_params=self.process_params,
                           prob=new_prob, dataset=new_dataset, smote_mask=new_smote_mask, y_str=new_y_str,
-                          from_fold=self.from_fold, feat_rank=self.feat_rank)
+                          from_fold=self.from_fold, feat_rank=self.feat_rank, metadata=new_metadata)
 
     def filter_patients_min_nights(self, min_nights: int) -> "FeatureSet":
         """Return a new FeatureSet that keeps only those patients (i.e. `group` IDs)
@@ -246,9 +307,18 @@ class FeatureSet:
         if self.y_str is not None and other.y_str is not None:
             merged_y_str = np.concatenate((self.y_str, other.y_str))
 
+        if self.metadata is None and other.metadata is None:
+            merged_metadata = None
+        elif self.metadata is not None and other.metadata is not None:
+            if list(self.metadata.columns) != list(other.metadata.columns):
+                raise ValueError("Metadata columns do not match between the two FeatureSets.")
+            merged_metadata = pd.concat([self.metadata, other.metadata], ignore_index=True)
+        else:
+            raise ValueError("Cannot merge FeatureSets when only one contains metadata.")
+
         return FeatureSet(x=merged_x, y=merged_y, group=merged_group, feat_map=self.feat_map, feat_rank=self.feat_rank,
                           process_params=None, smote_mask=merged_smote, prob=merged_prob, y_str=merged_y_str,
-                          dataset=merged_dataset)
+                          dataset=merged_dataset, metadata=merged_metadata)
 
     def get_strat_labels(self, stratify_by_dataset_if_pooled: bool = False):
         """ Create labels for stratification based on the y and dataset. For non_pooled datasets, just by class."""
@@ -525,7 +595,9 @@ class FeatureSet:
             x_sm, y_sm, g_sm, ds_sm, m_sm = apply_smote_with_group_mapping(
                 self.x, self.y, self.group, self.dataset, seed
             )
+            expanded_metadata = self._expand_metadata_after_smote(self.metadata, m_sm)
             self.x, self.y, self.group, self.dataset, self.smote_mask = x_sm, y_sm, g_sm, ds_sm, m_sm
+            self.metadata = expanded_metadata
 
             after_n_total = int(self.x.shape[0])
             num_new_total = after_n_total - before_n_total
@@ -552,7 +624,7 @@ class FeatureSet:
         ds = np.asarray(self.dataset)
         unique_sites = np.unique(ds)
 
-        xs, ys, gs, dss, masks = [], [], [], [], []
+        xs, ys, gs, dss, masks, metadata_parts = [], [], [], [], [], []
         per_site_new = {}
         base_n_total = 0
 
@@ -560,6 +632,7 @@ class FeatureSet:
             mask = (ds == site)
             x_sub, y_sub, g_sub = self.x[mask], self.y[mask], self.group[mask]
             ds_sub = self.dataset[mask] if self.dataset is not None else None
+            metadata_sub = self.metadata.loc[mask].reset_index(drop=True) if self.metadata is not None else None
             before_n = int(x_sub.shape[0])
 
             try:
@@ -577,6 +650,8 @@ class FeatureSet:
             gs.append(g_sm)
             dss.append(ds_sm)
             masks.append(m_sm)
+            if self.metadata is not None:
+                metadata_parts.append(self._expand_metadata_after_smote(metadata_sub, m_sm))
 
             after_n = int(x_sm.shape[0])
             per_site_new[str(site)] = int(after_n - before_n)
@@ -588,6 +663,8 @@ class FeatureSet:
         self.group = np.concatenate(gs)
         self.dataset = np.concatenate(dss) if dss[0] is not None else None
         self.smote_mask = np.concatenate(masks)
+        if self.metadata is not None:
+            self.metadata = pd.concat(metadata_parts, ignore_index=True)
 
         num_new_total = int(sum(per_site_new.values()))
         self.process_params['SMOTE'] = {'used': True, 'mode': 'per_ds', 'seed': seed,
