@@ -55,6 +55,7 @@ def _process_dataset(args: argparse.Namespace, processing_kwargs: dict, feature_
                     ax6_legacy_mode=args.ax6_legacy_mode,
                 )
                 file_processor.process(feature_kwargs, processing_kwargs, args, pbar)
+                file_processor._log_memory('returned to CLI', file_processor.saving_suffix)
                 del file_processor
                 gc.collect()
 

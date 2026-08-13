@@ -4,6 +4,8 @@ import logging
 from argparse import Namespace
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
+import resource
+import platform
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -28,6 +30,7 @@ __all__ = ['FileProcessor']
 
 
 class FileProcessor:
+    # TODO: parallelize on file level
     _delete_confirmation_given = False  # only relevant for 'delete_processed_files' operational modes
 
     def __init__(self, patient_id: str, record_id: str, label: str, acti_file_path: Path, save_dir: Path,
@@ -62,6 +65,7 @@ class FileProcessor:
         self.pbar = pbar
         self.feat_kwargs = feat_kwargs
         self.process_kwargs = process_kwargs
+        self._log_memory('start', self.saving_suffix)
 
         if self.pbar:
             self.pbar.set_description(f"[PROGRESS]: Processing files")
@@ -87,6 +91,8 @@ class FileProcessor:
 
         # 1. apply processing if needed
         processed_df, self.info = self._load_or_process_data(operational_kwargs.redo_processing)
+        self._log_memory('after load/preprocessing', self.saving_suffix)
+
         _processing_is_complete = bool(self.info.get('processing', {}).get('all_steps_successful') is True)
         if not _processing_is_complete:
             msg = f'Incomplete pre-processing detected for {self.saving_suffix}'
@@ -102,27 +108,35 @@ class FileProcessor:
             if self.pbar:
                 self.pbar.set_postfix({"file": f"{self.saving_suffix}", "status": "extr. movements"})
             selected_nights, move_bout_mask, move_bout_ids = self._segment_nocturnal_movements(processed_df)
+            self._log_memory('after movement segmentation', self.saving_suffix)
+
             local_feat_df, global_feat_df = self._calculate_features(
                 processed_df, selected_nights, move_bout_mask, move_bout_ids)
+            self._log_memory('after feature calculation', self.saving_suffix)
 
             _feat_dir = utils.check_make_dir(self.recording_save_dir.joinpath(f"features/{self.feat_kwargs['mode']}/"))
             global_feat_df.to_csv(_feat_dir.joinpath(f"global-features-{self.saving_suffix}.csv"))
             local_feat_df.to_csv(_feat_dir.joinpath(f"local-features-{self.saving_suffix}.csv"))
             utils.dump_to_json(self.info, self.recording_save_dir.joinpath(f"info-{self.saving_suffix}.json"))
             logger.info(f"(io: {self.saving_suffix}): features successfully saved")
+            self._log_memory('after feature saving', self.saving_suffix)
 
             # cleanup memory
             del local_feat_df, global_feat_df, selected_nights
+            self._log_memory('after feature cleanup', self.saving_suffix)
         else:
             logger.info(f"(io: {self.saving_suffix}): Skipping feature extraction."
                         f"('args.skip_feature_calc'={operational_kwargs.skip_feature_calc})")
 
         # 3. plotting (if specified)
         if operational_kwargs.create_plots:
+            self._log_memory('before plotting', self.saving_suffix)
             self._plot_data(processed_df)
+            self._log_memory('after plotting', self.saving_suffix)
 
         del processed_df
         gc.collect()
+        self._log_memory('after final cleanup', self.saving_suffix)
 
     def _validate_and_perform_deletion(self):
         """ Delete the processed .parquet file if all derived files exist. prompts for confirmation once."""
@@ -278,6 +292,9 @@ class FileProcessor:
             for night_idx, fig in cluster_plots.items():
                 fig.savefig(
                     _cluster_dir.joinpath(f"clusters-{self.saving_suffix}-night{night_idx}.png"), bbox_inches='tight')
+                plt.close(fig)
+            cluster_plots.clear()
+            gc.collect()
 
         return local_feat_df, global_feat_df
 
@@ -334,30 +351,85 @@ class FileProcessor:
             return None
 
     def _plot_data(self, processed_df: pd.DataFrame):
-        """Plots raw and processed data, saving the plots to disk."""
+        """Plot raw and processed data, saving the plots to disk."""
         from ..actimeter import ActimeterFactory
 
         def _save_plot(fig, path, data_type):
-            """Helper function to save a plot and log status."""
             if path.exists():
                 logger.info(f"(io: {self.saving_suffix}): {data_type} plot exists and will be overwritten.")
+
+            self._log_memory(f'before {data_type} savefig', self.saving_suffix)
             fig.savefig(path, bbox_inches='tight')
+            self._log_memory(f'after {data_type} savefig', self.saving_suffix)
+
             plt.close(fig)
             del fig
             gc.collect()
 
-        # Define paths
-        raw_plot_path = self.parquet_path.parent.joinpath(f"{self.saving_suffix}-raw.png")
-        processed_plot_path = self.parquet_path.parent.joinpath(f"{self.saving_suffix}-processed.png")
+            self._log_memory(f'after {data_type} close', self.saving_suffix)
 
-        # Plot raw data
+        raw_plot_path = self.parquet_path.parent / f'{self.saving_suffix}-raw.png'
+        processed_plot_path = self.parquet_path.parent / f'{self.saving_suffix}-processed.png'
+
+        self._log_memory('before raw loading', self.saving_suffix)
         raw_df = ActimeterFactory(self.acti_file_path, self.saving_suffix).load_raw_data()
+        self._log_memory('after raw loading', self.saving_suffix)
+
+        logger.info(
+            f'[plot-data] {self.saving_suffix}: raw rows={len(raw_df):,}, '
+            f'span={(raw_df.index.max() - raw_df.index.min()) / pd.Timedelta(days=1):.2f} days'
+        )
+
+        self._log_memory('before raw draw', self.saving_suffix)
         fig_raw, _ = draw_actigraphy_data(raw_df, self.sleep_log, raw_only=True)
-        _save_plot(fig_raw, raw_plot_path, "raw")
-
-        # Plot processed data
-        fig_pr, _ = draw_actigraphy_data(processed_df, self.sleep_log, raw_only=False)
-        _save_plot(fig_pr, processed_plot_path, "processed")
-
-        del raw_df
+        _save_plot(fig_raw, raw_plot_path, 'raw')
+        del fig_raw, _, raw_df
         gc.collect()
+        self._log_memory('after raw draw', self.saving_suffix)
+
+        logger.info(
+            f'[plot-data] {self.saving_suffix}: processed rows={len(processed_df):,}, '
+            f'span={(processed_df.index.max() - processed_df.index.min()) / pd.Timedelta(days=1):.2f} days'
+        )
+
+        self._log_memory('before processed draw', self.saving_suffix)
+        fig_processed, _ = draw_actigraphy_data(processed_df, self.sleep_log, raw_only=False)
+        _save_plot(fig_processed, processed_plot_path, 'processed')
+        del fig_processed, _, processed_df
+        gc.collect()
+        self._log_memory('after processed draw', self.saving_suffix)
+
+        self._log_memory('after plot-data cleanup', self.saving_suffix)
+
+    @staticmethod
+    def _log_memory(stage: str, saving_suffix: str) -> None:
+
+        def _rss_gb() -> float:
+            """ Current resident memory on Linux. Falls back to resource usage on macOS."""
+
+            if platform.system() == "Linux":
+                for line in Path("/proc/self/status").read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024 ** 2
+
+            # macOS fallback
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+            # macOS reports bytes, Linux reports KiB
+            if platform.system() == "Darwin":
+                return rss / 1024 ** 3
+            return rss / 1024 ** 2
+
+        def _peak_rss_gb() -> float:
+            """Peak resident memory (GiB)."""
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if platform.system() == "Darwin":
+                return rss / 1024 ** 3  # bytes -> GiB
+
+            return rss / 1024 ** 2  # KiB -> GiB
+
+        logger.info(
+            f"[memory] {saving_suffix:<20} | {stage:<30} | "
+            f"RSS={_rss_gb():6.2f} GiB | "
+            f"Peak={_peak_rss_gb():6.2f} GiB"
+        )
