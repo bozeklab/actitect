@@ -110,20 +110,44 @@ class FileProcessor:
             selected_nights, move_bout_mask, move_bout_ids = self._segment_nocturnal_movements(processed_df)
             self._log_memory('after movement segmentation', self.saving_suffix)
 
-            local_feat_df, global_feat_df = self._calculate_features(
-                processed_df, selected_nights, move_bout_mask, move_bout_ids)
-            self._log_memory('after feature calculation', self.saving_suffix)
+            if selected_nights.empty:
+                sleep_outcome = self.info.get('processing', {}).get('sleep_segmentation', {}).get('outcome')
+                feature_outcome = 'no_sptw_detected' if sleep_outcome == 'no_sptw_detected' else 'no_sptw_selected'
+                feature_info = self.info.setdefault('processing', {}).setdefault('feature_extraction', {})
+                feature_info.update({
+                    'status': 1,
+                    'outcome': feature_outcome,
+                    'num_selected_sptws': 0,
+                    'features_written': False,
+                })
+                utils.dump_to_json(self.info, self._info_path())
+                logger.warning(
+                    f"(io: {self.saving_suffix}): skipping feature extraction: {feature_outcome}. "
+                    "No feature CSVs will be written."
+                )
+                del selected_nights
+            else:
+                local_feat_df, global_feat_df = self._calculate_features(
+                    processed_df, selected_nights, move_bout_mask, move_bout_ids)
+                self._log_memory('after feature calculation', self.saving_suffix)
 
-            _feat_dir = utils.check_make_dir(self.recording_save_dir.joinpath(f"features/{self.feat_kwargs['mode']}/"))
-            global_feat_df.to_csv(_feat_dir.joinpath(f"global-features-{self.saving_suffix}.csv"))
-            local_feat_df.to_csv(_feat_dir.joinpath(f"local-features-{self.saving_suffix}.csv"))
-            utils.dump_to_json(self.info, self.recording_save_dir.joinpath(f"info-{self.saving_suffix}.json"))
-            logger.info(f"(io: {self.saving_suffix}): features successfully saved")
-            self._log_memory('after feature saving', self.saving_suffix)
+                _feat_dir = utils.check_make_dir(self.recording_save_dir.joinpath(f"features/{self.feat_kwargs['mode']}/"))
+                global_feat_df.to_csv(_feat_dir.joinpath(f"global-features-{self.saving_suffix}.csv"))
+                local_feat_df.to_csv(_feat_dir.joinpath(f"local-features-{self.saving_suffix}.csv"))
+                feature_info = self.info.setdefault('processing', {}).setdefault('feature_extraction', {})
+                feature_info.update({
+                    'status': 1,
+                    'outcome': 'features_written',
+                    'num_selected_sptws': int(len(selected_nights)),
+                    'features_written': True,
+                })
+                utils.dump_to_json(self.info, self._info_path())
+                logger.info(f"(io: {self.saving_suffix}): features successfully saved")
+                self._log_memory('after feature saving', self.saving_suffix)
 
-            # cleanup memory
-            del local_feat_df, global_feat_df, selected_nights
-            self._log_memory('after feature cleanup', self.saving_suffix)
+                # cleanup memory
+                del local_feat_df, global_feat_df, selected_nights
+                self._log_memory('after feature cleanup', self.saving_suffix)
         else:
             logger.info(f"(io: {self.saving_suffix}): Skipping feature extraction."
                         f"('args.skip_feature_calc'={operational_kwargs.skip_feature_calc})")
@@ -196,6 +220,16 @@ class FileProcessor:
         info_ok = self._info_path().exists()
         if operational_kwargs.skip_feature_calc:
             return info_ok and self.parquet_path.exists()
+
+        if info_ok:
+            try:
+                info = self._load_info()
+                feature_outcome = info.get('processing', {}).get('feature_extraction', {}).get('outcome')
+                if feature_outcome in {'no_sptw_detected', 'no_sptw_selected'}:
+                    return True
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
         # normal full pipeline
         return info_ok and self._global_feat_path().exists() and self._local_feat_path().exists()
 
@@ -243,7 +277,28 @@ class FileProcessor:
             night_start=params.night_start, night_end=params.night_end, during_night_h_thres=.1)
 
         selected_sptws = select_night_sptws(processed_df, params=params)
-        logger.info(f"({self.saving_suffix}) found {selected_sptws.shape[0]} full nights of sleep in data.")
+        n_selected = int(selected_sptws.shape[0])
+        logger.info(f"({self.saving_suffix}) found {n_selected} full nights of sleep in data.")
+
+        sleep_info = self.info['processing']['sleep_segmentation']
+        sleep_info['num_selected_sptws'] = n_selected
+        if n_selected == 0:
+            selection_outcome = (
+                'no_sptw_detected' if sleep_info.get('outcome') == 'no_sptw_detected' else 'no_sptw_selected'
+            )
+            sleep_info['selection_outcome'] = selection_outcome
+            sleep_info['selected_sptw_nights'] = {}
+            self.info['processing']['sleep_movements'].update({
+                'n_moves_total': 0,
+                'status': 1,
+                'outcome': f'not_run_{selection_outcome}',
+            })
+            self.info['processing']['non-wear'].update({'final_segments': non_wears.to_dict()})
+            del non_wears
+            gc.collect()
+            return selected_sptws, None, None
+
+        sleep_info['selection_outcome'] = 'sptw_selected'
 
         # mask the movement bouts:
         move_segment_mask, move_segment_ids, move_stats = segment_nocturnal_movements(processed_df, selected_sptws)
@@ -255,9 +310,10 @@ class FileProcessor:
         self.info['processing']['sleep_movements'].update({f"n_moves_total": len(move_segment_ids)})
         self.info['processing']['sleep_movements'].update(move_stats)
         selected_sptw_dict = selected_sptws.assign(**{'length(h)': lambda x: x['length(h)'].round(4)}).to_dict()
-        self.info['processing']['sleep_segmentation'].update({'selected_sptw_nights': {
+        sleep_info['selected_sptw_nights'] = {
             index: {key: value_list[index] for key, value_list in selected_sptw_dict.items()}
-            for index in range(len(next(iter(selected_sptw_dict.values()))))}})
+            for index in range(n_selected)
+        }
         self.info['processing']['non-wear'].update({'final_segments': non_wears.to_dict()})
 
         del non_wears

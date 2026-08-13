@@ -47,7 +47,7 @@ def _processing_step(step_name: str):
 
 class BaseDevice(ABC):
     """Abstract class representing different actimeter devices such as Axivity Ax6, GENEActive etc. Is used to load
-    and optionally pre-process data from a given recording of the specified devices. Provides the public methods 
+    and optionally pre-process data from a given recording of the specified devices. Provides the public methods
     'load_raw_data' and 'process' for this purpose. Subclasses like e.g. Axivity or GENEActive must implement
     the logic to parse the binary data in the abstract methods '__str__' and '_parse_binary_to_df'."""
 
@@ -340,9 +340,13 @@ class BaseDevice(ABC):
 
         _durations_h = np.array([sptw.get('duration(h)', np.nan) for sptw in _info['sptws'].values()])
         _durations_above_5h = _durations_h[np.where(_durations_h > 5)]
-        logger.info(f"(sleep-segmentation: {self.meta['patient_id']}) sleep-segmentation summary:"
-                    f"found n={len(_durations_h):.0f} sptws with n={len(_durations_above_5h):.0f} above 5h with "
-                    f"durations {np.nanmean(_durations_above_5h):.1f}±{np.nanstd(_durations_above_5h):.1f}h")
+        if len(_durations_above_5h):
+            duration_summary = f"{np.nanmean(_durations_above_5h):.1f}±{np.nanstd(_durations_above_5h):.1f}h"
+        else:
+            duration_summary = 'n/a'
+        logger.info(f"(sleep-segmentation: {self.meta['patient_id']}) sleep-segmentation summary: "
+                    f"found n={len(_durations_h):.0f} sptws with n={len(_durations_above_5h):.0f} above 5h; "
+                    f"durations {duration_summary}")
         utils.assert_valid_df(x_df)
         if 'wear' in x_df.columns:
             x_df, (_init_num_amb, _final_num_amb) = self._resolve_nonwear_sleep(x_df, _sptw, self.resolve_nw_params)
@@ -400,6 +404,7 @@ class BaseDevice(ABC):
             _info = dict(_info)  # ensure mutable copy
             _info['sptws'] = sptws_new
             _info['num_sptws'] = int(num_sptws_new)
+            _info['outcome'] = 'no_sptw_detected' if num_sptws_new == 0 else 'sptw_detected'
             if num_sleep_bouts_new is not None:
                 _info['num_sleep_bouts'] = int(num_sleep_bouts_new)
 

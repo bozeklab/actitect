@@ -75,7 +75,10 @@ class SleepDetector:
         z_sample_rate = 1 / self.sleep_params.raw_epoch_length
 
         start_datetime = data.index[0]
-        sptws = pd.DataFrame()
+        # Keep a stable schema even when the detector finds no SPTWs. Downstream
+        # summary/annotation code can then treat "no SPTW detected" as a valid
+        # algorithmic outcome rather than failing on missing columns.
+        sptws = pd.DataFrame(columns=['start_time', 'end_time'])
         for start_index, z_day in self._slice_data_by_day(  # loop over each day
                 z_angle_diff_med, start_datetime, self.sleep_params.day_offset, z_sample_rate):
 
@@ -116,7 +119,7 @@ class SleepDetector:
             :return: (pd.DataFrame) with row per sleep bout with information about number and start/end time."""
         sptws = sptws.copy()
         z_sample_rate = 1 / self.sleep_params.raw_epoch_length
-        sleep_bouts = pd.DataFrame()
+        sleep_bouts = pd.DataFrame(columns=['sptw_num', 'start_time', 'end_time', 'overnight'])
         for _sptw_num, _sptw in sptws.iterrows():
             start_index = round((_sptw['start_time'] - start_datetime).total_seconds() * z_sample_rate)
             end_index = round((_sptw['end_time'] - start_datetime).total_seconds() * z_sample_rate)
@@ -153,10 +156,13 @@ class SleepDetector:
 
     def _annotate_df(self, df_in: pd.DataFrame, sptws: pd.DataFrame, sleep_bouts: pd.DataFrame):
         """Adds boolean 'sptw' 'sleep_bout' (if not None) columns to original DataFrame to indicate sleep segments."""
-        # Initialize columns
+        # Always expose both boolean columns, including the valid zero-detection case.
         df_in['sptw'] = False
-        if isinstance(sleep_bouts, pd.DataFrame) and not sleep_bouts.empty:
-            df_in['sleep_bout'] = False
+        df_in['sleep_bout'] = False
+
+        if sptws.empty:
+            return df_in
+
         df_index = df_in.index.values
         sptw_start = sptws['start_time'].values
         sptw_end = sptws['end_time'].values
@@ -284,14 +290,26 @@ class SleepDetector:
         """ Summarizes the detected sptws and sleep bouts. Returns a Tuple of sptws with updated columns and an info
         with summarizing statistics."""
 
-        info = {'num_sptws': sptws.shape[0]}
+        info = {
+            'num_sptws': int(sptws.shape[0]),
+            'num_sleep_bouts': int(sleep_bouts.shape[0]) if isinstance(sleep_bouts, pd.DataFrame) else 0,
+            'outcome': 'no_sptw_detected' if sptws.empty else 'sptw_detected',
+        }
+
+        if sptws.empty:
+            # Preserve the fields expected by downstream consumers while explicitly
+            # recording that the detector completed successfully with zero detections.
+            info['sptws'] = {}
+            sptws = sptws.copy()
+            sptws['length(h)'] = pd.Series(dtype=float)
+            return sptws, info
+
         if isinstance(sleep_bouts, pd.DataFrame) and not sleep_bouts.empty:
             stats = self.sptw_stats(sptws, sleep_bouts)
             sptws['duration(h)'] = np.round(stats['sptw_duration'].values, 4)
             sptws['sleep(h)'] = np.round(stats['sleep_duration'].values, 4)
             sptws['se'] = np.round(stats['se'].values, 4)
             sptws['waso'] = np.round(stats['waso'].values, 4)
-            info.update({'num_sleep_bouts': sleep_bouts.shape[0]})
 
         sptw_dict = utils.dict_minus_key(sptws.to_dict(), ['relative_date', 'sptw_num'])
         info.update({'sptws': {index: {key: value_list[index] for key, value_list in sptw_dict.items()
