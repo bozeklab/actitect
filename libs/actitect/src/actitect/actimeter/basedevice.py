@@ -51,6 +51,8 @@ class BaseDevice(ABC):
     'load_raw_data' and 'process' for this purpose. Subclasses like e.g. Axivity or GENEActive must implement
     the logic to parse the binary data in the abstract methods '__str__' and '_parse_binary_to_df'."""
 
+    _NYQUIST_CUTOFF_FRACTION = 0.95
+
     def __init__(
             self,
             filepath: Optional[Path],
@@ -281,12 +283,49 @@ class BaseDevice(ABC):
 
     @_processing_step('filter')
     def _apply_butterworth_filter(self, x_df: pd.DataFrame, kwargs, filter_name: str):
-        """Applies either a Butterworth low- or highpass filter to the data.
-         'filter_name' indicates if it is the high/lowpass for correct info logging."""
-        kwargs['fs'] = (self.processing_info['resampling'].get('resample_fs_mean')
-                        or np.ceil(self.processing_info['resampling'].get('raw_fs_mean'))).astype('int')
+        """Apply a Butterworth low- or high-pass filter to the data.
+
+        For a requested low-pass cutoff at or above Nyquist, cap the effective
+        cutoff at a small margin below Nyquist instead of skipping the filter.
+        The requested and effective cutoffs are both recorded for provenance.
+        """
+        kwargs = dict(kwargs)
+
+        resampled_fs = self.processing_info['resampling'].get('resample_fs_mean')
+        raw_fs = self.processing_info['resampling'].get('raw_fs_mean')
+        fs = resampled_fs if resampled_fs is not None else raw_fs
+        if fs is None or not np.isfinite(fs) or fs <= 0:
+            raise RuntimeError(f"{filter_name} failed: invalid sampling rate '{fs}'")
+
+        fs = float(fs)
+        kwargs['fs'] = fs
+
+        requested_highcut = kwargs.get('highcut')
+        effective_highcut = requested_highcut
+        nyquist_hz = fs / 2.0
+        cutoff_adjusted = False
+
+        if filter_name == 'lowpass' and requested_highcut is not None and requested_highcut >= nyquist_hz:
+            effective_highcut = self._NYQUIST_CUTOFF_FRACTION * nyquist_hz
+            kwargs['highcut'] = effective_highcut
+            cutoff_adjusted = True
+            logger.warning(
+                f"(filter: {self.meta['patient_id']}) requested low-pass cutoff "
+                f"{requested_highcut:.3f} Hz is not below Nyquist ({nyquist_hz:.3f} Hz at fs={fs:.3f} Hz). "
+                f"Using Nyquist-safe cutoff {effective_highcut:.3f} Hz "
+                f"({self._NYQUIST_CUTOFF_FRACTION:.0%} of Nyquist)."
+            )
+
         x_df, info = processing.butterworth_bandpass(x_df, **kwargs)
+        info.update({
+            'kwargs': kwargs.copy(),
+            'requested_highcut_hz': requested_highcut,
+            'effective_highcut_hz': effective_highcut,
+            'nyquist_hz': nyquist_hz,
+            'cutoff_adjusted_to_nyquist': cutoff_adjusted,
+        })
         self.processing_info['filter'].update({filter_name: info})
+
         ok = info.get('ok', None)
         if ok in (0, False):
             status = info.get('status', 'filter_failed')
@@ -294,8 +333,6 @@ class BaseDevice(ABC):
             raise RuntimeError(f"{filter_name} failed: {status}" + (f" ({msg})" if msg else ""))
 
         utils.assert_valid_df(x_df)
-
-        self.processing_info['filter'].update({f"{filter_name}": {'kwargs': kwargs}})
         return x_df
 
     @_processing_step('calibration')
@@ -340,13 +377,9 @@ class BaseDevice(ABC):
 
         _durations_h = np.array([sptw.get('duration(h)', np.nan) for sptw in _info['sptws'].values()])
         _durations_above_5h = _durations_h[np.where(_durations_h > 5)]
-        if len(_durations_above_5h):
-            duration_summary = f"{np.nanmean(_durations_above_5h):.1f}±{np.nanstd(_durations_above_5h):.1f}h"
-        else:
-            duration_summary = 'n/a'
-        logger.info(f"(sleep-segmentation: {self.meta['patient_id']}) sleep-segmentation summary: "
-                    f"found n={len(_durations_h):.0f} sptws with n={len(_durations_above_5h):.0f} above 5h; "
-                    f"durations {duration_summary}")
+        logger.info(f"(sleep-segmentation: {self.meta['patient_id']}) sleep-segmentation summary:"
+                    f"found n={len(_durations_h):.0f} sptws with n={len(_durations_above_5h):.0f} above 5h with "
+                    f"durations {np.nanmean(_durations_above_5h):.1f}±{np.nanstd(_durations_above_5h):.1f}h")
         utils.assert_valid_df(x_df)
         if 'wear' in x_df.columns:
             x_df, (_init_num_amb, _final_num_amb) = self._resolve_nonwear_sleep(x_df, _sptw, self.resolve_nw_params)
@@ -404,7 +437,6 @@ class BaseDevice(ABC):
             _info = dict(_info)  # ensure mutable copy
             _info['sptws'] = sptws_new
             _info['num_sptws'] = int(num_sptws_new)
-            _info['outcome'] = 'no_sptw_detected' if num_sptws_new == 0 else 'sptw_detected'
             if num_sleep_bouts_new is not None:
                 _info['num_sleep_bouts'] = int(num_sleep_bouts_new)
 

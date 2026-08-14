@@ -11,7 +11,7 @@ __all__ = ['butterworth_bandpass', 'butterworth_bandpass_array', 'fft_and_psd']
 logger = logging.getLogger(__name__)
 
 
-def butterworth_bandpass(data: pd.DataFrame, fs: int, lowcut: float, highcut: float, degree=5, axis=0):
+def butterworth_bandpass(data: pd.DataFrame, fs: float, lowcut: float, highcut: float, degree=5, axis=0):
     """ Apply a Butterworth bandpass, highpass, or lowpass filter to the x, y, and z components of the input DataFrame.
 
     Parameters:
@@ -28,7 +28,7 @@ def butterworth_bandpass(data: pd.DataFrame, fs: int, lowcut: float, highcut: fl
     info = {}
 
     signal = data[['x', 'y', 'z']].to_numpy()
-    f_nyq = fs // 2
+    f_nyq = fs / 2.0
 
     if lowcut is not None:
         if not (0 < lowcut < f_nyq):
@@ -69,8 +69,8 @@ def butterworth_bandpass(data: pd.DataFrame, fs: int, lowcut: float, highcut: fl
     return data, info
 
 
-def butterworth_bandpass_array(signal: np.ndarray, fs: int, lowcut: float, highcut: float, degree=5, axis=0):
-    f_nyq = fs // 2
+def butterworth_bandpass_array(signal: np.ndarray, fs: float, lowcut: float, highcut: float, degree=5, axis=0):
+    f_nyq = fs / 2.0
 
     if lowcut is not None and f_nyq <= lowcut:
         logger.warning(f"Skipping lowpass filter: sample rate {fs} too low for cutoff rate {lowcut}")
